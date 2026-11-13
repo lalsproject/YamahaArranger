@@ -19,8 +19,14 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
+        // Default: arm64-v8a + armeabi-v7a (dipakai CI).
+        // Override: gradle assembleDebug -PtargetAbis=armeabi-v7a
+        val targetAbis = (project.findProperty("targetAbis") as String?)
+            ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+            ?: listOf("arm64-v8a", "armeabi-v7a")
+
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            abiFilters += targetAbis
         }
 
         externalNativeBuild {
