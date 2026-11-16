@@ -51,12 +51,33 @@ private val SxDim = Color(0xFF9AA3AD)
 @Composable
 fun SxMainScreen(
     viewModel: MainViewModel = hiltViewModel(),
-    onOpenInspector: () -> Unit = {}
+    onOpenInspector: () -> Unit = {},
+    onRequestStorageAccess: () -> Unit = {}
 ) {
     val state by viewModel.uiState.collectAsState()
+    val storage by viewModel.storageSettings.collectAsState()
+    var showStorageSettings by remember { mutableStateOf(false) }
     val stylePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(viewModel::onStyleFilePicked) }
     val soundFontPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(viewModel::onSoundFontFilePicked) }
     val context = LocalContext.current
+    // Folder pickers: the SAF tree URI is converted to a real path because the
+    // app and the native SoundFont loader work with plain files.
+    val styleFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val path = StoragePrefs.treeUriToPath(uri)
+            if (path == null || !viewModel.setStyleFolder(path)) {
+                Toast.makeText(context, "Folder tidak bisa dipakai. Pilih folder di penyimpanan internal / SD card.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+    val sf2FolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val path = StoragePrefs.treeUriToPath(uri)
+            if (path == null || !viewModel.setSoundFontFolder(path)) {
+                Toast.makeText(context, "Folder tidak bisa dipakai. Pilih folder di penyimpanan internal / SD card.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
     val saveLogLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
         if (uri != null) {
             val fullTrace = DebugLog.getFullText()
@@ -92,7 +113,7 @@ fun SxMainScreen(
         val regH = if (compact) 48.dp else 56.dp
         val footerH = if (compact) 28.dp else 32.dp
         Column(Modifier.fillMaxSize().padding(horizontal = 7.dp, vertical = 5.dp)) {
-            SxHeader(state, headerH) { showSf2Manager = true }
+            SxHeader(state, headerH, onSettings = { showStorageSettings = true }) { showSf2Manager = true }
             Spacer(Modifier.height(gap))
             SxNavBar(
                 navH,
@@ -260,10 +281,23 @@ fun SxMainScreen(
                 showSf2Manager = false
             },
             onRefresh = viewModel::refreshSoundFontList,
+            onFolder = { showSf2Manager = false; showStorageSettings = true },
             onImport = {
                 showSf2Manager = false
                 soundFontPicker.launch(arrayOf("audio/x-soundfont", "application/octet-stream", "audio/*", "*/*"))
             }
+        )
+    }
+
+    if (showStorageSettings) {
+        SxStorageSettingsDialog(
+            settings = storage,
+            onDismiss = { showStorageSettings = false },
+            onChooseStyle = { styleFolderPicker.launch(null) },
+            onResetStyle = { viewModel.setStyleFolder(null) },
+            onChooseSf2 = { sf2FolderPicker.launch(null) },
+            onResetSf2 = { viewModel.setSoundFontFolder(null) },
+            onGrantAccess = onRequestStorageAccess
         )
     }
 
@@ -444,7 +478,7 @@ private fun SxMixRow(label: String, value: Int, onChange: (Int) -> Unit, onLongP
     }
 }
 @Composable
-private fun SxSf2ManagerDialog(files: List<Pair<Uri, String>>, currentName: String, onDismiss: () -> Unit, onSelect: (Uri, String) -> Unit, onRefresh: () -> Unit, onImport: () -> Unit) {
+private fun SxSf2ManagerDialog(files: List<Pair<Uri, String>>, currentName: String, onDismiss: () -> Unit, onSelect: (Uri, String) -> Unit, onRefresh: () -> Unit, onFolder: () -> Unit, onImport: () -> Unit) {
     Dialog(onDismissRequest = onDismiss) {
         Surface(color = SxPanel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth(.9f).fillMaxHeight(.75f)) {
             Column(Modifier.fillMaxSize().padding(10.dp)) {
@@ -473,6 +507,7 @@ private fun SxSf2ManagerDialog(files: List<Pair<Uri, String>>, currentName: Stri
                 Spacer(Modifier.height(5.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                     Button(onClick = onRefresh, modifier = Modifier.weight(1f)) { Text("REFRESH", fontSize = 8.sp) }
+                    Button(onClick = onFolder, modifier = Modifier.weight(1f)) { Text("FOLDER", fontSize = 8.sp) }
                     Button(onClick = onImport, modifier = Modifier.weight(1f)) { Text("IMPORT", fontSize = 8.sp) }
                 }
             }
@@ -481,7 +516,71 @@ private fun SxSf2ManagerDialog(files: List<Pair<Uri, String>>, currentName: Stri
 }
 
 @Composable
-private fun SxHeader(state: MainUiState, height: Dp, onPickSoundFont: () -> Unit) {
+private fun SxStorageSettingsDialog(
+    settings: StorageSettings,
+    onDismiss: () -> Unit,
+    onChooseStyle: () -> Unit,
+    onResetStyle: () -> Unit,
+    onChooseSf2: () -> Unit,
+    onResetSf2: () -> Unit,
+    onGrantAccess: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(color = SxPanel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth(.92f).fillMaxHeight(.88f)) {
+            Column(Modifier.fillMaxSize().padding(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("STORAGE SETTINGS", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onDismiss) { Text("CLOSE") }
+                }
+                Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Surface(color = SxPanel2, shape = RoundedCornerShape(4.dp), modifier = Modifier.fillMaxWidth()) {
+                        Row(Modifier.padding(9.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("FILE ACCESS", color = SxDim, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                Text(
+                                    if (settings.hasPublicStorageAccess) "Granted" else "Not granted - app uses its own folder until granted",
+                                    color = if (settings.hasPublicStorageAccess) SxGreen else SxOrangeBright, fontSize = 10.sp
+                                )
+                            }
+                            if (!settings.hasPublicStorageAccess) Button(onClick = onGrantAccess) { Text("GRANT", fontSize = 8.sp) }
+                        }
+                    }
+                    SxFolderSettingRow("STYLE FOLDER", settings.styleDir, settings.styleIsCustom, settings.styleDirReadable, onChooseStyle, onResetStyle)
+                    SxFolderSettingRow("SOUNDFONT (SF2) FOLDER", settings.sf2Dir, settings.sf2IsCustom, settings.sf2DirReadable, onChooseSf2, onResetSf2)
+                    Text(
+                        "Style: .STY / .PRS / .SST. Sub-folders become the categories in STYLE; files directly in the folder are listed too. " +
+                            "SF2: changing the folder loads the SoundFonts found there. Default: /storage/emulated/0/YamahaArranger/{Styles,SF2}.",
+                        color = SxDim, fontSize = 8.sp
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SxFolderSettingRow(title: String, path: String, custom: Boolean, readable: Boolean, onChoose: () -> Unit, onReset: () -> Unit) {
+    Surface(color = SxPanel2, shape = RoundedCornerShape(4.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(9.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, color = SxDim, fontSize = 8.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Text(if (custom) "CUSTOM" else "DEFAULT", color = if (custom) SxOrangeBright else SxDim, fontSize = 8.sp)
+            }
+            Text(path, color = Color.White, fontSize = 10.sp)
+            Text(
+                if (readable) "Folder OK" else "Folder not readable / not created yet (check file access)",
+                color = if (readable) SxGreen else SxOrangeBright, fontSize = 8.sp
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Button(onClick = onChoose) { Text("CHOOSE…", fontSize = 8.sp) }
+                if (custom) OutlinedButton(onClick = onReset) { Text("RESET TO DEFAULT", fontSize = 8.sp) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SxHeader(state: MainUiState, height: Dp, onSettings: () -> Unit, onPickSoundFont: () -> Unit) {
     Surface(color = Color(0xFF080A0C), shape = RoundedCornerShape(5.dp), modifier = Modifier.fillMaxWidth().height(height).border(1.dp, Color(0xFF333A42), RoundedCornerShape(5.dp))) {
         Row(Modifier.fillMaxSize().padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("YAMAHA", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
@@ -489,6 +588,10 @@ private fun SxHeader(state: MainUiState, height: Dp, onPickSoundFont: () -> Unit
             Spacer(Modifier.width(8.dp)); Text("YamahaArranger", color = Color(0xFF6EA7D2), fontSize = 8.sp)
             Spacer(Modifier.weight(1f))
             Text("● MIDI", color = if (state.midiStatus.startsWith("No")) SxDim else SxGreen, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.width(8.dp))
+            Surface(color = Color(0xFF252B31), shape = RoundedCornerShape(3.dp), modifier = Modifier.clickable(onClick = onSettings).border(1.dp, Color(0xFF39434B), RoundedCornerShape(3.dp))) {
+                Text("FOLDER", color = Color.White, fontSize = 7.sp, maxLines = 1, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
+            }
             Spacer(Modifier.width(8.dp))
             Surface(color = if (state.soundFontName == "None" || state.soundFontName == "Load failed") Color(0xFF252B31) else SxBlueDark,
                 shape = RoundedCornerShape(3.dp), modifier = Modifier.clickable(onClick = onPickSoundFont).border(1.dp, Color(0xFF39434B), RoundedCornerShape(3.dp))) {
@@ -800,12 +903,14 @@ private fun SxStyleLcdPage(
     onBrowse: () -> Unit,
     onBack: () -> Unit
 ) {
-    val visibleStyleFiles = remember(selectedStyleFolderUri, styleFiles) {
+    val visibleStyleFiles = remember(selectedStyleFolderUri, styleFiles, styleFolders) {
         val folderPath = selectedStyleFolderUri?.path?.let(Uri::decode)?.trimEnd('/')
+        val isRoot = styleFolders.firstOrNull { it.uri == selectedStyleFolderUri }?.isRoot == true
         if (folderPath == null) emptyList()
         else styleFiles.filter { (uri, _) ->
             val p = uri.path?.let(Uri::decode)?.trimEnd('/') ?: return@filter false
-            p.startsWith(folderPath + "/")
+            // Root folder = only files directly inside it; others include sub-folders.
+            if (isRoot) p.substringBeforeLast('/') == folderPath else p.startsWith(folderPath + "/")
         }
     }
     var page by remember(selectedStyleFolderUri) { mutableStateOf(0) }

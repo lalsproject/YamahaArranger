@@ -1,4 +1,5 @@
 #include "bassmidi_player.h"
+#include "sf2_header.h"
 #include <android/log.h>
 #include <algorithm>
 #include <fstream>
@@ -47,6 +48,22 @@ static void uiLog(const char* fmt, ...) {
 }
 #define LOGI(...) uiLog(__VA_ARGS__)
 #define LOGE(...) uiLog(__VA_ARGS__)
+
+namespace {
+
+const char* bassErrorText(int code) {
+    switch (code) {
+        case BASS_ERROR_MEM: return "out of memory";
+        case BASS_ERROR_FILEOPEN: return "cannot open file / no permission";
+        case BASS_ERROR_FILEFORM: return "unsupported or corrupt SoundFont format";
+        case BASS_ERROR_INIT: return "BASS not initialised";
+        case BASS_ERROR_ILLPARAM: return "illegal parameter";
+        case BASS_ERROR_NOTAVAIL: return "not available";
+        default: return "see BASS error codes";
+    }
+}
+
+} // namespace
 
 BassMidiPlayer::BassMidiPlayer() {
     ensureEngine();
@@ -252,19 +269,21 @@ bool BassMidiPlayer::loadRole(const std::string& path, bool drum) {
 
     std::string fontPath = path;
     if (!drum) {
-        melodyBassPath_ = path + ".bassmidi-normalized.sf2";
-        if (!normalizeMelodySf2(path, melodyBassPath_)) {
+        // Identity mapping (all banks <= 126) loads the original file with no
+        // copy at all; packed Yamaha banks get a streamed, cached working copy.
+        if (!normalizeMelodySf2(path, fontPath)) {
             LOGE("BASSMIDI melody normalization failed; refusing packed Yamaha banks");
             melodyBassPath_.clear();
             return false;
         }
-        fontPath = melodyBassPath_;
+        melodyBassPath_ = fontPath;
     }
 
     target = BASS_MIDI_FontInit(fontPath.c_str(), 0);
     if (!target) {
-        LOGE("FontInit failed role=%s error=%d",
-             drum ? "DRUM" : "MELODY", BASS_ErrorGetCode());
+        const int code = BASS_ErrorGetCode();
+        LOGE("FontInit failed role=%s error=%d (%s) file=%s",
+             drum ? "DRUM" : "MELODY", code, bassErrorText(code), fontPath.c_str());
         return false;
     }
 
@@ -317,11 +336,43 @@ bool BassMidiPlayer::load(const std::string& path) {
 }
 
 bool BassMidiPlayer::loadMelody(const std::string& path) {
-    return loadRole(path, false);
+    // A bad_alloc / filesystem error must never escape through JNI (that
+    // aborts the whole process); report it as a normal load failure instead.
+    try {
+        return loadRole(path, false);
+    } catch (const std::exception& e) {
+        LOGE("SF2 MELODY load exception: %s", e.what());
+    } catch (...) {
+        LOGE("SF2 MELODY load: unknown exception");
+    }
+    return false;
 }
 
 bool BassMidiPlayer::loadDrum(const std::string& path) {
-    return loadRole(path, true);
+    try {
+        return loadRole(path, true);
+    } catch (const std::exception& e) {
+        LOGE("SF2 DRUM load exception: %s", e.what());
+    } catch (...) {
+        LOGE("SF2 DRUM load: unknown exception");
+    }
+    return false;
+}
+
+void BassMidiPlayer::setWorkDir(const std::string& dir) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    workDir_ = dir;
+    while (workDir_.size() > 1 && workDir_.back() == '/') workDir_.pop_back();
+}
+
+std::string BassMidiPlayer::normalizedPathFor(const std::string& sourcePath) const {
+    if (workDir_.empty()) return sourcePath + ".bassmidi-normalized.sf2";
+    const size_t slash = sourcePath.rfind('/');
+    std::string base = slash == std::string::npos ? sourcePath : sourcePath.substr(slash + 1);
+    if (base.size() > 80) base.resize(80);
+    char hash[24];
+    std::snprintf(hash, sizeof(hash), "%08zx", std::hash<std::string>{}(sourcePath));
+    return workDir_ + "/" + base + "." + hash + ".bassmidi-normalized.sf2";
 }
 
 void BassMidiPlayer::unload() {
@@ -367,95 +418,35 @@ void BassMidiPlayer::send(int channel, DWORD event, DWORD param) {
     }
 }
 
-namespace {
-
-// Walk the SF2 RIFF structure to locate the real preset-header chunk.
-// Never scan raw sample data byte-by-byte: the PCM in "sdta" can contain
-// the four ASCII bytes "phdr" by coincidence.  The preset table is the
-// "phdr" sub-chunk of the "pdta" LIST.
-bool findPhdrChunk(const std::vector<unsigned char>& data,
-                   const unsigned char*& phdrData, uint32_t& phdrSize) {
-    phdrData = nullptr;
-    phdrSize = 0;
-    if (data.size() < 12) return false;
-    if (std::memcmp(data.data(), "RIFF", 4) != 0) return false;
-    if (std::memcmp(data.data() + 8, "sfbk", 4) != 0) return false;
-
-    size_t pos = 12;
-    while (pos + 8 <= data.size()) {
-        const uint32_t chunkSize =
-            static_cast<uint32_t>(data[pos + 4]) |
-            (static_cast<uint32_t>(data[pos + 5]) << 8) |
-            (static_cast<uint32_t>(data[pos + 6]) << 16) |
-            (static_cast<uint32_t>(data[pos + 7]) << 24);
-        const size_t chunkDataStart = pos + 8;
-        if (chunkDataStart > data.size() ||
-            chunkSize > data.size() - chunkDataStart) {
-            return false;
-        }
-
-        if (std::memcmp(data.data() + pos, "LIST", 4) == 0 &&
-            chunkSize >= 4 &&
-            std::memcmp(data.data() + chunkDataStart, "pdta", 4) == 0) {
-            const size_t listEnd = chunkDataStart + chunkSize;
-            size_t subPos = chunkDataStart + 4;
-            while (subPos + 8 <= listEnd) {
-                const uint32_t subSize =
-                    static_cast<uint32_t>(data[subPos + 4]) |
-                    (static_cast<uint32_t>(data[subPos + 5]) << 8) |
-                    (static_cast<uint32_t>(data[subPos + 6]) << 16) |
-                    (static_cast<uint32_t>(data[subPos + 7]) << 24);
-                const size_t subDataStart = subPos + 8;
-                if (subDataStart > listEnd ||
-                    subSize > listEnd - subDataStart) {
-                    return false;
-                }
-                if (std::memcmp(data.data() + subPos, "phdr", 4) == 0) {
-                    phdrData = data.data() + subDataStart;
-                    phdrSize = subSize;
-                    return true;
-                }
-                subPos = subDataStart + subSize + (subSize & 1u);
-            }
-            return false;
-        }
-
-        pos = chunkDataStart + chunkSize + (chunkSize & 1u);
-    }
-    return false;
-}
-
-} // namespace
 
 // BASSMIDI's FONTEX source bank is limited to the 128 SF2 banks. Yamaha
 // variation banks such as 1025 (= MSB 8, LSB 1) therefore cannot be passed
 // directly as sbank.  SF2 itself has no Bank-LSB field either.  Normalize the
 // preset-header bank numbers into unique legal SF2 banks while retaining a
 // side-table that maps each normalized bank back to Yamaha MSB/LSB.
+//
+// Only the small phdr chunk is read (never the whole file). When every melodic
+// bank is already a legal source bank (<= 126, i.e. ordinary GM/XG-style
+// fonts) the mapping is the identity, nothing has to be rewritten and the
+// original file is loaded directly. Otherwise a working copy with patched
+// phdr bank fields is streamed to the work dir once and reused afterwards.
 bool BassMidiPlayer::normalizeMelodySf2(const std::string& sourcePath,
-                                        const std::string& outputPath) {
-    std::ifstream file(sourcePath, std::ios::binary);
-    if (!file) {
-        LOGE("SF2 normalize: cannot open %s", sourcePath.c_str());
-        return false;
-    }
-    std::vector<unsigned char> data(
-        (std::istreambuf_iterator<char>(file)),
-        std::istreambuf_iterator<char>());
+                                        std::string& fontPathOut) {
+    fontPathOut = sourcePath;
+    normalizedBanks_.clear();
 
-    const unsigned char* phdrData = nullptr;
-    uint32_t phdrSize = 0;
-    if (!findPhdrChunk(data, phdrData, phdrSize) ||
-        phdrSize < 38 || phdrSize % 38 != 0) {
-        LOGE("SF2 normalize: invalid phdr in %s", sourcePath.c_str());
+    sf2::PhdrChunk phdr;
+    std::string err;
+    if (!sf2::readPhdr(sourcePath, phdr, &err)) {
+        LOGE("SF2 normalize: %s (%s)", err.c_str(), sourcePath.c_str());
         return false;
     }
 
     // Collect every melodic source bank. Bank 127/128 are reserved for drums.
     std::set<int> rawBanks;
-    const size_t count = phdrSize / 38;
+    const size_t count = phdr.recordCount();
     for (size_t n = 0; n + 1 < count; ++n) {
-        const unsigned char* rec = phdrData + n * 38;
+        const unsigned char* rec = phdr.bytes.data() + n * 38;
         const int bank = static_cast<int>(rec[22]) |
                          (static_cast<int>(rec[23]) << 8);
         if (bank != 127 && bank != 128) rawBanks.insert(bank);
@@ -467,7 +458,16 @@ bool BassMidiPlayer::normalizeMelodySf2(const std::string& sourcePath,
         return false;
     }
 
-    normalizedBanks_.clear();
+    const bool identity = rawBanks.empty() || *rawBanks.rbegin() <= 126;
+    if (identity) {
+        for (int rawBank : rawBanks) {
+            normalizedBanks_.push_back({rawBank, rawBank, rawBank, 0});
+        }
+        LOGI("SF2 normalize: identity bank mapping (%u banks), loading original file directly",
+             static_cast<unsigned>(normalizedBanks_.size()));
+        return true;
+    }
+
     int nextVirtual = 0;
     std::unordered_map<int, int> rawToVirtual;
     for (int rawBank : rawBanks) {
@@ -488,34 +488,40 @@ bool BassMidiPlayer::normalizeMelodySf2(const std::string& sourcePath,
 
     // Rewrite only phdr bank fields. All preset bags, instruments, samples,
     // modulators, generators and sample data remain byte-for-byte unchanged.
-    // Because every raw bank gets its own virtual bank, programs from
-    // different Yamaha LSB banks can never collide.
-    const uintptr_t phdrOffset =
-        static_cast<uintptr_t>(phdrData - data.data());
-    unsigned char* mutablePhdr = data.data() + phdrOffset;
+    sf2::PhdrChunk patched = phdr;
     for (size_t n = 0; n + 1 < count; ++n) {
-        unsigned char* rec = mutablePhdr + n * 38;
+        unsigned char* rec = patched.bytes.data() + n * 38;
         const int rawBank = static_cast<int>(rec[22]) |
                             (static_cast<int>(rec[23]) << 8);
         if (rawBank == 127 || rawBank == 128) continue;
         const auto it = rawToVirtual.find(rawBank);
-        if (it == rawToVirtual.end()) return false;
-        const int virtualBank = it->second;
-        rec[22] = static_cast<unsigned char>(virtualBank & 0xff);
-        rec[23] = static_cast<unsigned char>((virtualBank >> 8) & 0xff);
+        if (it == rawToVirtual.end()) { normalizedBanks_.clear(); return false; }
+        rec[22] = static_cast<unsigned char>(it->second & 0xff);
+        rec[23] = static_cast<unsigned char>((it->second >> 8) & 0xff);
     }
 
-    std::ofstream out(outputPath, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        LOGE("SF2 normalize: cannot create %s", outputPath.c_str());
+    const std::string outputPath = normalizedPathFor(sourcePath);
+
+    // Reuse an existing working copy when it is complete and carries exactly
+    // the phdr we would write (cheap check: only the phdr chunk is read).
+    sf2::PhdrChunk existing;
+    std::string ignored;
+    if (sf2::readPhdr(outputPath, existing, &ignored) &&
+        existing.fileSize == phdr.fileSize && sf2::sameBytes(existing, patched)) {
+        fontPathOut = outputPath;
+        LOGI("SF2 normalize: reusing working copy %s (melodicBanks=%u)",
+             outputPath.c_str(), static_cast<unsigned>(normalizedBanks_.size()));
+        return true;
+    }
+
+    LOGI("SF2 normalize: creating working copy %s (%llu MB)", outputPath.c_str(),
+         static_cast<unsigned long long>(phdr.fileSize >> 20));
+    if (!sf2::copyWithPatchedPhdr(sourcePath, outputPath, patched, &err)) {
+        LOGE("SF2 normalize: %s", err.c_str());
+        normalizedBanks_.clear();
         return false;
     }
-    out.write(reinterpret_cast<const char*>(data.data()),
-              static_cast<std::streamsize>(data.size()));
-    if (!out.good()) {
-        LOGE("SF2 normalize: write failed %s", outputPath.c_str());
-        return false;
-    }
+    fontPathOut = outputPath;
 
     LOGI("SF2 normalize OK: %s -> %s melodicBanks=%u",
          sourcePath.c_str(), outputPath.c_str(),
@@ -533,23 +539,14 @@ void BassMidiPlayer::rebuildDrumPresetCache(
     cache.clear();
     if (path.empty()) return;
 
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        LOGI("SF2 drum preset cache: cannot open %s", path.c_str());
+    sf2::PhdrChunk phdr;
+    std::string err;
+    if (!sf2::readPhdr(path, phdr, &err)) {
+        LOGI("SF2 drum preset cache: %s path=%s", err.c_str(), path.c_str());
         return;
     }
-
-    std::vector<unsigned char> data(
-        (std::istreambuf_iterator<char>(file)),
-        std::istreambuf_iterator<char>());
-
-    const unsigned char* phdrData = nullptr;
-    uint32_t phdrSize = 0;
-    if (!findPhdrChunk(data, phdrData, phdrSize) ||
-        phdrSize < 38 || phdrSize % 38 != 0) {
-        LOGI("SF2 drum preset cache: phdr not found path=%s", path.c_str());
-        return;
-    }
+    const unsigned char* phdrData = phdr.bytes.data();
+    const uint32_t phdrSize = phdr.size;
 
     const size_t count = phdrSize / 38;
     for (size_t n = 0; n + 1 < count; ++n) {
@@ -609,22 +606,15 @@ bool BassMidiPlayer::findDrumPreset(const std::string& path,
 void BassMidiPlayer::rebuildMelodyPresetCache(const std::string& path) {
     melodyPresetCache_.clear();
     if (path.empty()) return;
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        LOGI("SF2 melodic preset cache: cannot open %s", path.c_str());
-        return;
-    }
-    std::vector<unsigned char> data(
-        (std::istreambuf_iterator<char>(file)),
-        std::istreambuf_iterator<char>());
 
-    const unsigned char* phdrData = nullptr;
-    uint32_t phdrSize = 0;
-    if (!findPhdrChunk(data, phdrData, phdrSize) ||
-        phdrSize < 38 || phdrSize % 38 != 0) {
-        LOGI("SF2 melodic preset cache: phdr not found path=%s", path.c_str());
+    sf2::PhdrChunk phdr;
+    std::string err;
+    if (!sf2::readPhdr(path, phdr, &err)) {
+        LOGI("SF2 melodic preset cache: %s path=%s", err.c_str(), path.c_str());
         return;
     }
+    const unsigned char* phdrData = phdr.bytes.data();
+    const uint32_t phdrSize = phdr.size;
 
     const size_t count = phdrSize / 38;
     for (size_t n = 0; n + 1 < count; ++n) {
@@ -1125,67 +1115,49 @@ std::string BassMidiPlayer::presetList() const {
     auto scanSf2 = [&](const std::string& path, const char* role) {
         if (path.empty()) return;
 
-        std::ifstream file(path, std::ios::binary);
-        if (!file) {
-            LOGI("SF2 %s preset scan: cannot open %s", role, path.c_str());
+        sf2::PhdrChunk phdr;
+        std::string err;
+        if (!sf2::readPhdr(path, phdr, &err)) {
+            LOGI("SF2 %s preset scan: %s (%s)", role, err.c_str(), path.c_str());
             return;
         }
 
-        std::vector<unsigned char> data(
-            (std::istreambuf_iterator<char>(file)),
-            std::istreambuf_iterator<char>());
+        const size_t count = phdr.recordCount();
+        size_t added = 0;
+        for (size_t n = 0; n + 1 < count; ++n) {
+            const unsigned char* rec = phdr.bytes.data() + n * 38;
+            size_t nameLen = 0;
+            while (nameLen < 20 && rec[nameLen] != 0) ++nameLen;
 
-        const char phdr[] = {'p','h','d','r'};
-        for (size_t i = 0; i + 8 <= data.size(); ++i) {
-            if (std::memcmp(data.data() + i, phdr, 4) != 0) continue;
+            std::string name(reinterpret_cast<const char*>(rec), nameLen);
+            const int program = static_cast<int>(rec[20]) |
+                (static_cast<int>(rec[21]) << 8);
+            const int bank = static_cast<int>(rec[22]) |
+                (static_cast<int>(rec[23]) << 8);
 
-            const uint32_t size =
-                static_cast<uint32_t>(data[i + 4]) |
-                (static_cast<uint32_t>(data[i + 5]) << 8) |
-                (static_cast<uint32_t>(data[i + 6]) << 16) |
-                (static_cast<uint32_t>(data[i + 7]) << 24);
-
-            if (size < 38 || size % 38 != 0 || i + 8 + size > data.size())
-                continue;
-
-            const size_t count = size / 38;
-            size_t added = 0;
-            for (size_t n = 0; n + 1 < count; ++n) {
-                const unsigned char* rec = data.data() + i + 8 + n * 38;
-                size_t nameLen = 0;
-                while (nameLen < 20 && rec[nameLen] != 0) ++nameLen;
-
-                std::string name(reinterpret_cast<const char*>(rec), nameLen);
-                const int program = static_cast<int>(rec[20]) |
-                    (static_cast<int>(rec[21]) << 8);
-                const int bank = static_cast<int>(rec[22]) |
-                    (static_cast<int>(rec[23]) << 8);
-
-                // The separators are part of the native/Kotlin contract.
-                // Sanitize control characters so a broken SF2 name can never
-                // corrupt the record framing.
-                for (char& ch : name) {
-                    if (ch == '\r' || ch == '\n' || ch == '\x1e' || ch == '\x1f')
-                        ch = ' ';
-                }
-                if (name.empty()) {
-                    name = "Preset " + std::to_string(bank) + ":" +
-                           std::to_string(program);
-                }
-
-                found.push_back({role, bank, program, name});
-                ++added;
+            // The separators are part of the native/Kotlin contract.
+            // Sanitize control characters so a broken SF2 name can never
+            // corrupt the record framing.
+            for (char& ch : name) {
+                if (ch == '\r' || ch == '\n' || ch == '\x1e' || ch == '\x1f')
+                    ch = ' ';
+            }
+            if (name.empty()) {
+                name = "Preset " + std::to_string(bank) + ":" +
+                       std::to_string(program);
             }
 
-            if (added > 0) {
-                LOGI("SF2 %s phdr scan found %u entries from %s",
-                     role, static_cast<unsigned>(added), path.c_str());
-                return;
-            }
+            found.push_back({role, bank, program, name});
+            ++added;
         }
 
-        LOGI("SF2 %s phdr scan found no selectable presets from %s",
-             role, path.c_str());
+        if (added > 0) {
+            LOGI("SF2 %s phdr scan found %u entries from %s",
+                 role, static_cast<unsigned>(added), path.c_str());
+        } else {
+            LOGI("SF2 %s phdr scan found no selectable presets from %s",
+                 role, path.c_str());
+        }
     };
 
     // Enumerate both loaded fonts. Melody and drum SF2s are separate assets,

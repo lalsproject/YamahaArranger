@@ -14,6 +14,8 @@ public:
     bool loadMelody(const std::string& path);
     bool loadDrum(const std::string& path);
     void unload();
+    // Directory for generated working copies (app cache). Optional.
+    void setWorkDir(const std::string& dir);
     bool isLoaded() const { return stream_ != 0 && (melodyFont_ != 0 || drumFont_ != 0); }
     bool isMelodyLoaded() const { return stream_ != 0 && melodyFont_ != 0; }
     bool isDrumLoaded() const { return stream_ != 0 && drumFont_ != 0; }
@@ -54,7 +56,8 @@ private:
     bool ensureEngine();
     bool loadRole(const std::string& path, bool drum);
     bool applyFonts();
-    bool normalizeMelodySf2(const std::string& sourcePath, const std::string& outputPath);
+    bool normalizeMelodySf2(const std::string& sourcePath, std::string& fontPathOut);
+    std::string normalizedPathFor(const std::string& sourcePath) const;
     void send(int channel, DWORD event, DWORD param);
     void preloadCurrentPreset(int channel);
     void rebuildDrumPresetCache(const std::string& path,
@@ -82,4 +85,5 @@ private:
     std::string melodyPath_;
     std::string melodyBassPath_;
     std::string drumPath_;
+    std::string workDir_;
 };

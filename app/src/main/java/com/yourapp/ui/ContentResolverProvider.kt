@@ -15,27 +15,56 @@ import java.util.Locale
 import javax.inject.Inject
 import javax.inject.Singleton
 
-data class StyleFolder(val uri: Uri, val name: String, val styleCount: Int)
+/** [isRoot] marks the configured style folder itself, shown when .STY files sit directly in it. */
+data class StyleFolder(val uri: Uri, val name: String, val styleCount: Int, val isRoot: Boolean = false)
 
 @Singleton
 class ContentResolverProvider @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val storagePrefs: StoragePrefs
 ) {
+    // Folders are user-configurable (Settings > Storage). Resolved on every
+    // access so a changed setting or a newly granted permission takes effect
+    // immediately.
     private val sf2RootDir: File
-        get() = File(Environment.getExternalStorageDirectory(), "YamahaArranger/SF2")
+        get() = storagePrefs.sf2Dir()
 
     private val styleRootDir: File
-        get() = File(Environment.getExternalStorageDirectory(), "YamahaArranger/Styles")
+        get() = storagePrefs.styleDir()
+
+    fun storageSettings(): StorageSettings = storagePrefs.snapshot()
+
+    fun hasPublicStorageAccess(): Boolean = storagePrefs.hasPublicStorageAccess()
+
+    /** Pass null to go back to the default folder. Returns false if the folder is unusable. */
+    fun setStyleDir(path: String?): Boolean {
+        if (!path.isNullOrBlank() && !isUsableDir(File(path))) return false
+        storagePrefs.setCustomStyleDir(path)
+        ensureStyleFolder()
+        return true
+    }
+
+    fun setSf2Dir(path: String?): Boolean {
+        if (!path.isNullOrBlank() && !isUsableDir(File(path))) return false
+        storagePrefs.setCustomSf2Dir(path)
+        ensureSoundFontFolder()
+        return true
+    }
+
+    private fun isUsableDir(dir: File): Boolean = try {
+        (dir.isDirectory || dir.mkdirs()) && dir.canRead()
+    } catch (_: Exception) {
+        false
+    }
 
     fun ensureStyleFolder() {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-                Timber.w("YamahaArranger Styles folder requires MANAGE_EXTERNAL_STORAGE")
-                return
+            val dir = styleRootDir
+            if (!dir.isDirectory && !dir.mkdirs()) {
+                Timber.w("Could not create style folder: ${dir.absolutePath}")
             }
-            styleRootDir.mkdirs()
         } catch (e: Exception) {
-            Timber.w(e, "Could not create YamahaArranger/Styles folder")
+            Timber.w(e, "Could not create style folder")
         }
     }
 
@@ -97,8 +126,11 @@ class ContentResolverProvider @Inject constructor(
         // Fallback for devices where direct File.listFiles() cannot enumerate
         // shared-storage children reliably. MANAGE_EXTERNAL_STORAGE also
         // permits access to MediaStore.Files.
+        // NOTE: Environment.isExternalStorageManager() only exists on Android 11+.
+        // Calling it on Android 10 (API 29) threw NoSuchMethodError, so the
+        // access check goes through StoragePrefs which is API-level safe.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-            Environment.isExternalStorageManager()
+            storagePrefs.hasPublicStorageAccess()
         ) {
             val prefix = styleRootDir.absolutePath.trimEnd('/') + "/"
             val mediaUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
@@ -149,14 +181,14 @@ class ContentResolverProvider @Inject constructor(
 
     fun listStyleFolders(): List<StyleFolder> {
         ensureStyleFolder()
-        val allFiles = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
+        val allFiles = storagePrefs.hasPublicStorageAccess()
         val children = styleRootDir.listFiles()
         Timber.i(
             "🎼 Style root: path=\u0024{styleRootDir.absolutePath} exists=\u0024{styleRootDir.exists()} " +
                 "dir=\u0024{styleRootDir.isDirectory} canRead=\u0024{styleRootDir.canRead()} " +
                 "allFiles=\u0024allFiles children=\u0024{children?.size ?: -1}"
         )
-        return children
+        val folders = children
             ?.filter { it.isDirectory }
             ?.sortedBy { it.name.lowercase() }
             ?.map { dir ->
@@ -172,16 +204,34 @@ class ContentResolverProvider @Inject constructor(
                 )
             }
             ?: emptyList()
+
+        // Styles that sit directly in the configured folder (no sub-folders) would
+        // otherwise never be shown by the folder-first Style Select page.
+        val rootStyles = styleRootDir.listFiles { f -> isStyleFile(f) }?.size ?: 0
+        return if (rootStyles > 0) {
+            listOf(
+                StyleFolder(
+                    uri = Uri.fromFile(styleRootDir),
+                    name = styleRootDir.name.ifBlank { "STYLES" },
+                    styleCount = rootStyles,
+                    isRoot = true
+                )
+            ) + folders
+        } else {
+            folders
+        }
     }
 
     fun listAllStylesInFolders(): List<Pair<Uri, String>> {
         ensureStyleFolder()
-        return styleRootDir.listFiles()
+        val rootFiles = styleRootDir.listFiles { f -> isStyleFile(f) }?.toList() ?: emptyList()
+        val nested = styleRootDir.listFiles()
             ?.filter { it.isDirectory }
             ?.flatMap { styleFilesUnder(it) }
-            ?.sortedBy { it.absolutePath.lowercase() }
-            ?.map { Uri.fromFile(it) to it.name }
             ?: emptyList()
+        return (rootFiles + nested)
+            .sortedBy { it.absolutePath.lowercase() }
+            .map { Uri.fromFile(it) to it.name }
     }
 
     fun listStyles(): List<Pair<Uri, String>> {
@@ -197,6 +247,15 @@ class ContentResolverProvider @Inject constructor(
             val rawPath = folderUri.path ?: return emptyList()
             val path = Uri.decode(rawPath)
             var dir = File(path)
+
+            // The configured root itself: only the styles directly inside it
+            // (sub-folders are listed as their own folders).
+            if (dir.canonicalPath == styleRootDir.canonicalPath) {
+                val direct = dir.listFiles { f -> isStyleFile(f) }
+                    ?.sortedBy { it.name.lowercase() }
+                    ?: emptyList()
+                return direct.map { Uri.fromFile(it) to it.name }
+            }
 
             // Uri paths can be encoded differently by Android/Compose. If the
             // URI-derived File does not enumerate, resolve the folder again
@@ -246,89 +305,186 @@ class ContentResolverProvider @Inject constructor(
 
     fun getFilesDir(): File = context.filesDir
 
-    fun getSoundFontLocation(): String =
-        "/storage/emulated/0/YamahaArranger/SF2"
+    fun getSoundFontLocation(): String = sf2RootDir.absolutePath
 
-    /**
-     * Shared, user-visible SF2 storage.
-     *
-     * Android 10+ uses MediaStore.Downloads so the file appears in the normal
-     * Download folder without broad storage permission. Older Android versions
-     * fall back to the public Download directory.
-     */
+    fun getStyleLocation(): String = styleRootDir.absolutePath
+
+    /** Creates the SoundFont folder (default or user-chosen). Never throws. */
     fun ensureSoundFontFolder() {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-                Timber.w("YamahaArranger root folder requires MANAGE_EXTERNAL_STORAGE")
+            val dir = sf2RootDir
+            if (!dir.isDirectory && !dir.mkdirs()) {
+                Timber.w("Could not create SF2 folder: ${dir.absolutePath}")
                 return
             }
-            sf2RootDir.mkdirs()
-            File(sf2RootDir, "PUT_SF2_FILES_HERE.txt").takeIf { !it.exists() }?.writeText(
-                "Place your SoundFont .sf2 files in this folder.\n"
-            )
+            // Only drop the hint file into the app's own default folder, never
+            // into a folder the user pointed us at (it may be their SF2 library).
+            if (storagePrefs.customSf2Dir() == null) {
+                File(dir, "PUT_SF2_FILES_HERE.txt").takeIf { !it.exists() }?.writeText(
+                    "Place your SoundFont .sf2 files in this folder.\n"
+                )
+            }
         } catch (e: Exception) {
-            Timber.w(e, "Could not create YamahaArranger/SF2 folder")
+            Timber.w(e, "Could not create SF2 folder")
         }
     }
 
-    /** True when the URI already points at /storage/emulated/0/YamahaArranger/SF2. */
+    /** True when the URI is a file directly inside the configured SoundFont folder. */
     fun isSoundFontInManagedFolder(uri: Uri): Boolean {
         return try {
-            val target = when (uri.scheme) {
-                "file" -> File(uri.path ?: return false).canonicalPath
-                else -> uri.path ?: return false
-            }
-            target.contains("/YamahaArranger/SF2", ignoreCase = true)
+            if (uri.scheme != "file") return false
+            val parent = File(uri.path ?: return false).canonicalFile.parentFile?.canonicalPath
+            parent != null && parent == sf2RootDir.canonicalPath
         } catch (_: Exception) { false }
     }
+
+    private fun querySize(uri: Uri): Long = try {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
+            ?.use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else -1L } ?: -1L
+    } catch (_: Exception) {
+        -1L
+    }
+
+    /**
+     * Copies a picked SoundFont into the SF2 folder. The copy goes to a ".part"
+     * file first and is only renamed when complete, so a full disk or an
+     * interrupted copy can never leave a truncated .sf2 that later fails to load.
+     */
     @Synchronized
     fun saveSoundFont(uri: Uri, displayName: String): Uri? {
         val safeName = displayName.substringAfterLast('/').ifBlank { "font.sf2" }
             .let { if (it.lowercase().endsWith(".sf2")) it else it + ".sf2" }
+        ensureSoundFontFolder()
+        val dir = sf2RootDir
+        if (!dir.isDirectory) {
+            DebugLog.add("❌ SF2 folder unavailable: ${dir.absolutePath} - open SETTINGS and grant storage access or choose another folder")
+            return null
+        }
+        val dest = File(dir, safeName)
+        val part = File(dir, "$safeName.part")
         return try {
-            ensureSoundFontFolder()
-            if (!sf2RootDir.exists()) return null
-            val dest = File(sf2RootDir, safeName)
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                dest.outputStream().use { output -> input.copyTo(output) }
-            } ?: return null
-            if (dest.length() > 0) Uri.fromFile(dest) else null
+            val size = querySize(uri)
+            if (size > 0 && dir.usableSpace < size + 8L * 1024 * 1024) {
+                DebugLog.add("❌ Not enough free space in ${dir.absolutePath}: need ${(size shr 20) + 8} MB, free ${dir.usableSpace shr 20} MB")
+                return null
+            }
+            val input = context.contentResolver.openInputStream(uri)
+            if (input == null) {
+                DebugLog.add("❌ Cannot open the picked SF2 file")
+                return null
+            }
+            input.use { src -> part.outputStream().use { out -> src.copyTo(out, 1 shl 20) } }
+            if (part.length() == 0L || (size > 0 && part.length() != size)) {
+                DebugLog.add("❌ SF2 copy incomplete (${part.length()} of $size bytes)")
+                part.delete()
+                return null
+            }
+            if (dest.exists()) dest.delete()
+            if (!part.renameTo(dest)) {
+                DebugLog.add("❌ Cannot finalize SF2 file in ${dir.absolutePath}")
+                part.delete()
+                return null
+            }
+            Uri.fromFile(dest)
         } catch (e: Exception) {
-            Timber.e(e, "Failed storing SF2 in /storage/emulated/0/YamahaArranger/SF2")
+            part.delete()
+            DebugLog.add("❌ Failed storing SF2: ${e.javaClass.simpleName}: ${e.message}")
+            Timber.e(e, "Failed storing SF2 in ${dir.absolutePath}")
             null
         }
     }
+
+    private fun isSoundFontFile(f: File): Boolean =
+        f.isFile && f.extension.equals("sf2", true) &&
+            !f.name.endsWith(NORMALIZED_SUFFIX, ignoreCase = true)
+
     /**
-     * Finds an SF2 created by YamahaArranger in the public folder.
+     * Finds an SF2 in the configured SoundFont folder.
      * Returns the Uri and display name.
      */
     fun findSoundFont(displayName: String? = null): Pair<Uri, String>? {
         ensureSoundFontFolder()
         val wantedName = displayName?.trim()
         val file = if (wantedName != null) File(sf2RootDir, wantedName)
-        else sf2RootDir.listFiles { f -> f.isFile && f.extension.equals("sf2", true) }
+        else sf2RootDir.listFiles { f -> isSoundFontFile(f) }
             ?.sortedByDescending { it.lastModified() }?.firstOrNull()
         return file?.takeIf { it.exists() && it.length() > 0 }?.let { Uri.fromFile(it) to it.name }
     }
 
     fun listSoundFonts(): List<Pair<Uri, String>> {
         ensureSoundFontFolder()
-        return sf2RootDir.listFiles { f -> f.isFile && f.extension.equals("sf2", true) }
+        val dir = sf2RootDir
+        val files = dir.listFiles { f -> isSoundFontFile(f) }
+        if (files == null) {
+            DebugLog.add("❌ Cannot list SF2 folder ${dir.absolutePath} (exists=${dir.exists()} canRead=${dir.canRead()}) - check storage access in SETTINGS")
+        }
+        return files
+            ?.filter { it.length() > 0 }
             ?.sortedBy { it.name.lowercase() }
             ?.map { Uri.fromFile(it) to it.name }
             ?: emptyList()
     }
-    fun copySoundFontToCache(uri: Uri, displayName: String): File? {
-        val dir = File(context.cacheDir, "sf2").apply { mkdirs() }
-        val dest = File(dir, displayName)
-        return try {
-            openInputStream(uri)?.use { input ->
-                dest.outputStream().use { output -> input.copyTo(output) }
+
+    /** Directory the native loader uses for generated (bank-normalized) SF2 working copies. */
+    fun soundFontWorkDir(): File = File(context.cacheDir, "sf2work").apply { mkdirs() }
+
+    /**
+     * Older builds copied every SF2 into cache/sf2 on each load (plus a second
+     * normalized copy), which could fill the device storage and make later
+     * loads fail. Remove that leftover data once.
+     */
+    fun cleanupLegacySoundFontCache() {
+        try {
+            val legacy = File(context.cacheDir, "sf2")
+            if (legacy.isDirectory) {
+                val freed = legacy.walkBottomUp().filter { it.isFile }.sumOf { it.length() }
+                legacy.deleteRecursively()
+                DebugLog.add("🧹 Removed legacy SF2 cache (${freed shr 20} MB)")
             }
-            dest.takeIf { it.length() > 0 }
         } catch (e: Exception) {
-            Timber.e(e, "Failed caching SF2")
+            Timber.w(e, "Legacy SF2 cache cleanup failed")
+        }
+    }
+
+    /**
+     * Returns a readable file for the SoundFont. Files that already live on
+     * storage are loaded in place (no copy). Only non-file URIs (content://)
+     * are streamed into cache, with a free-space check and without leaving a
+     * truncated copy behind.
+     */
+    fun prepareSoundFontFile(uri: Uri, displayName: String): File? {
+        if (uri.scheme == "file") {
+            val f = File(uri.path ?: return null)
+            if (f.isFile && f.canRead() && f.length() > 0) return f
+            DebugLog.add("❌ SF2 not readable: ${f.absolutePath} (exists=${f.exists()} canRead=${f.canRead()} size=${f.length()}) - check storage access in SETTINGS")
+            return null
+        }
+        val dir = File(context.cacheDir, "sf2-import").apply { mkdirs() }
+        val safeName = displayName.substringAfterLast('/').ifBlank { "font.sf2" }
+        val dest = File(dir, safeName)
+        val part = File(dir, "$safeName.part")
+        return try {
+            val size = querySize(uri)
+            if (size > 0 && dir.usableSpace < size + 8L * 1024 * 1024) {
+                DebugLog.add("❌ Not enough cache space for $safeName: need ${(size shr 20) + 8} MB, free ${dir.usableSpace shr 20} MB")
+                return null
+            }
+            val input = openInputStream(uri) ?: return null
+            input.use { src -> part.outputStream().use { out -> src.copyTo(out, 1 shl 20) } }
+            if (part.length() == 0L || (size > 0 && part.length() != size)) {
+                part.delete()
+                return null
+            }
+            if (dest.exists()) dest.delete()
+            if (part.renameTo(dest)) dest else null
+        } catch (e: Exception) {
+            part.delete()
+            DebugLog.add("❌ Failed caching SF2: ${e.javaClass.simpleName}: ${e.message}")
             null
         }
+    }
+
+    private companion object {
+        const val NORMALIZED_SUFFIX = ".bassmidi-normalized.sf2"
     }
 }

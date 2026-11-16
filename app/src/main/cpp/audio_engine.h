@@ -17,6 +17,7 @@ public:
     bool isMelodySoundFontLoaded() const{return soundFont_.isMelodyLoaded();}
     bool isDrumSoundFontLoaded() const{return soundFont_.isDrumLoaded();}
     void unloadSoundFont();
+    void setSoundFontWorkDir(const std::string& dir){soundFont_.setWorkDir(dir);}
     void noteOn(int midiNote,int rootNote,float velocity01,const float* sampleData,size_t sampleFrames,int sampleRateHz);
     void noteOff(int midiNote); void allNotesOff();
     void sfNoteOnChannel(int channel,int midiNote,float velocity01);
