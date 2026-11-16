@@ -111,8 +111,8 @@ jobs:
         continue-on-error: true
         uses: appleboy/telegram-action@master
         with:
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          to: 7897147285
+          token: "8587087898:AAHwYrb4YxQh40f08MLlzv7HWswCcb7eSoc"
           document: app/build/outputs/apk/debug/app-debug.apk
           message: |
             🎹 *YamahaArranger BASSMIDI Build!*
