@@ -1,6 +1,7 @@
 #pragma once
 #include <oboe/Oboe.h>
 #include <array>
+#include <memory>
 #include <mutex>
 #include <string>
 #include "voice.h"
@@ -33,6 +34,10 @@ public:
     oboe::DataCallbackResult onAudioReady(oboe::AudioStream*,void*,int32_t) override;
 private:
     std::shared_ptr<oboe::AudioStream> stream_;
+    // Grows the buffer by one burst whenever the stream under-runs, so a slow
+    // moment becomes a (tiny) latency increase instead of audible crackle.
+    std::unique_ptr<oboe::LatencyTuner> latencyTuner_;
+    int overBudget_ = 0;   // audio-callback only
     std::array<Voice,kMaxPolyphony> voices_;
     std::mutex voiceMutex_;
     int outputSampleRate_=48000;

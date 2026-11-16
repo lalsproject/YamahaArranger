@@ -2,6 +2,8 @@
 #include <string>
 #include <mutex>
 #include <array>
+#include <atomic>
+#include <unordered_map>
 #include <vector>
 #include <bass.h>
 #include <bassmidi.h>
@@ -19,7 +21,16 @@ public:
     bool isLoaded() const { return stream_ != 0 && (melodyFont_ != 0 || drumFont_ != 0); }
     bool isMelodyLoaded() const { return stream_ != 0 && melodyFont_ != 0; }
     bool isDrumLoaded() const { return stream_ != 0 && drumFont_ != 0; }
+    // Realtime audio thread entry point. Deliberately does NOT take mutex_:
+    // preset resolution / font preloading / SF2 loading hold that mutex for a
+    // long time and would starve the callback (= dropouts). BASS stream calls
+    // are thread-safe, so the callback only needs the stream handle.
     void render(float* out, int numFrames);
+    // Called from the audio thread when rendering keeps exceeding its time
+    // budget: lowers the BASSMIDI sample-rate-conversion quality one step
+    // (8-point sinc -> linear) instead of letting the device glitch. Returns
+    // true if a step was taken.
+    bool degradeQuality();
     void noteOn(int channel, int key, float velocity);
     void noteOff(int channel, int key);
     void allNotesOff();
@@ -63,19 +74,28 @@ private:
     void rebuildDrumPresetCache(const std::string& path,
                                 std::vector<DrumPresetEntry>& cache);
     void rebuildMelodyPresetCache(const std::string& path);
+    struct ResolvedPreset { int bank; int program; std::string name; };
+    mutable std::unordered_map<std::string, ResolvedPreset> resolveCache_;
+    bool findMelodicPresetUncached(const std::string& path, int requestedBank, int requestedProgram,
+                           const std::string& voiceName, int& sourceBank, int& sourceProgram,
+                           std::string& matchedName) const;
     bool findMelodicPreset(const std::string& path, int requestedBank, int requestedProgram,
                            const std::string& voiceName, int& sourceBank, int& sourceProgram,
                            std::string& matchedName) const;
     bool findDrumPreset(const std::string& path, int requestedProgram,
                         int& sourceBank, int& sourceProgram) const;
     HSTREAM stream_ = 0;
+    std::atomic<HSTREAM> renderStream_{0};
     HSOUNDFONT melodyFont_ = 0;
     HSOUNDFONT drumFont_ = 0;
     bool bassInitialized_ = false;
     mutable std::mutex mutex_;
     int sampleRate_ = 48000;
-    int interpolation_ = 2;
-    int voices_ = 1000;
+    std::atomic<int> interpolation_{2};
+    // 256 matches the polyphony of the PSR-SX class instruments. 1000 allowed
+    // runaway voice counts (long releases + sustain) that exceed the CPU of
+    // mid-range devices and caused sudden dropouts.
+    int voices_ = 256;
     float soundFontVolume_ = 0.90f;
     std::array<ChannelState, 16> channels_{};
     std::vector<DrumPresetEntry> melodyDrumPresetCache_;

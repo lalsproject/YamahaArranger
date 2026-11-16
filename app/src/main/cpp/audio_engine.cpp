@@ -1,5 +1,7 @@
 #include "audio_engine.h"
+#include "native_log.h"
 #include <android/log.h>
+#include <chrono>
 #include <cstring>
 #include <algorithm>
 #include <cstdarg>
@@ -17,20 +19,7 @@ static void uiLog(const char* fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
-    if (g_jvm && g_debugLogClass && g_debugLogAddMethod) {
-        JNIEnv* env = nullptr;
-        bool attached = false;
-        if (g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-            if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) attached = true;
-        }
-        if (env) {
-            jstring jmsg = env->NewStringUTF(buf);
-            env->CallStaticVoidMethod(g_debugLogClass, g_debugLogAddMethod, jmsg);
-            env->DeleteLocalRef(jmsg);
-            if (attached) g_jvm->DetachCurrentThread();
-        }
-    }
+    nativeLogPost(LOG_TAG, buf);   // non-blocking, see native_log.h
 }
 #define LOGI(...) uiLog(__VA_ARGS__)
 #define LOGE(...) uiLog(__VA_ARGS__)
@@ -91,10 +80,14 @@ bool AudioEngine::start() {
              targetBufferFrames, bufferResult.error());
     }
 
+    latencyTuner_ = std::make_unique<oboe::LatencyTuner>(*stream_);
+    overBudget_ = 0;
+
     result = stream_->requestStart();
     if (result != oboe::Result::OK) {
         LOGE("Failed to start stream: %s", oboe::convertToText(result));
         stream_->close();
+        latencyTuner_.reset();
         stream_.reset();
         return false;
     }
@@ -106,7 +99,8 @@ bool AudioEngine::start() {
 void AudioEngine::stop() {
     if (stream_) {
         stream_->requestStop();
-        stream_->close();
+        stream_->close();           // returns after the callback has finished
+        latencyTuner_.reset();
         stream_.reset();
     }
 }
@@ -151,7 +145,21 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(
         // Do not add a second compressor/soft-clip/DC filter here. MIDI
         // Voyager leaves BASS/BASSMIDI's synth dynamics intact; the SF2
         // itself is normally operated around 90% volume to avoid overload.
+        const auto t0 = std::chrono::steady_clock::now();
         soundFont_.render(out, numFrames);
+        const auto usedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        const double budgetUs = 1.0e6 * numFrames / std::max(1, outputSampleRate_);
+        if (usedUs > budgetUs * 0.80) {
+            overBudget_ += 2;
+            if (overBudget_ >= 12) {          // sustained, not a one-off hiccup
+                overBudget_ = 0;
+                soundFont_.degradeQuality();
+            }
+        } else if (overBudget_ > 0) {
+            --overBudget_;
+        }
+        if (latencyTuner_) latencyTuner_->tune();
 
         for (int i = 0; i < sampleCount; ++i) {
             out[i] = std::max(-1.0f, std::min(1.0f, out[i]));

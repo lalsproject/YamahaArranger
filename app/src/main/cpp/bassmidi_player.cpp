@@ -1,5 +1,6 @@
 #include "bassmidi_player.h"
 #include "sf2_header.h"
+#include "native_log.h"
 #include <android/log.h>
 #include <algorithm>
 #include <fstream>
@@ -31,23 +32,21 @@ static void uiLog(const char* fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
-    if (g_jvm && g_debugLogClass && g_debugLogAddMethod) {
-        JNIEnv* env = nullptr;
-        bool attached = false;
-        if (g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-            if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) attached = true;
-        }
-        if (env) {
-            jstring jmsg = env->NewStringUTF(buf);
-            env->CallStaticVoidMethod(g_debugLogClass, g_debugLogAddMethod, jmsg);
-            env->DeleteLocalRef(jmsg);
-            if (attached) g_jvm->DetachCurrentThread();
-        }
-    }
+    nativeLogPost(LOG_TAG, buf);   // non-blocking, see native_log.h
+}
+
+// Very chatty per-preset diagnostics: logcat only, no JNI / in-app log.
+static void logcatLog(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    nativeLogcatOnly(LOG_TAG, buf);
 }
 #define LOGI(...) uiLog(__VA_ARGS__)
 #define LOGE(...) uiLog(__VA_ARGS__)
+#define LOGV(...) logcatLog(__VA_ARGS__)
 
 namespace {
 
@@ -117,6 +116,7 @@ bool BassMidiPlayer::ensureEngine() {
             LOGE("BASS_MIDI_StreamCreate failed error=%d", BASS_ErrorGetCode());
             return false;
         }
+        renderStream_.store(stream_, std::memory_order_release);
 
         // Yamaha style timing is PPQ 1920. This is mostly relevant if later
         // we feed tick-timed event batches; realtime note events remain
@@ -126,7 +126,7 @@ bool BassMidiPlayer::ensureEngine() {
         // 16-point sinc is the highest BASSMIDI SRC quality available on
         // ARM/NEON and is the quality path we want for an arranger.
         BASS_ChannelSetAttribute(stream_, BASS_ATTRIB_MIDI_SRC,
-                                 static_cast<float>(interpolation_));
+                                 static_cast<float>(interpolation_.load()));
 
         BASS_ChannelSetAttribute(stream_, BASS_ATTRIB_MIDI_VOICES,
                                  static_cast<float>(voices_));
@@ -139,7 +139,7 @@ bool BassMidiPlayer::ensureEngine() {
         BASS_MIDI_StreamEvent(stream_, 9, MIDI_EVENT_DRUMS, 1);
 
         LOGI("BASSMIDI stream ready: PPQN=1920 SRC=%d voices=%d",
-             interpolation_, voices_);
+             interpolation_.load(), voices_);
     }
 
     return true;
@@ -261,6 +261,7 @@ bool BassMidiPlayer::loadRole(const std::string& path, bool drum) {
         melodyPath_.clear();
         melodyDrumPresetCache_.clear();
         melodyPresetCache_.clear();
+    resolveCache_.clear();
     }
     if (target) {
         BASS_MIDI_FontFree(target);
@@ -393,6 +394,7 @@ void BassMidiPlayer::unload() {
         drumFont_ = 0;
     }
     if (stream_) {
+        renderStream_.store(0, std::memory_order_release);
         BASS_StreamFree(stream_);
         stream_ = 0;
     }
@@ -402,6 +404,7 @@ void BassMidiPlayer::unload() {
     melodyBassPath_.clear();
     drumPath_.clear();
     melodyPresetCache_.clear();
+    resolveCache_.clear();
     melodyDrumPresetCache_.clear();
     normalizedBanks_.clear();
     drumDrumPresetCache_.clear();
@@ -605,6 +608,7 @@ bool BassMidiPlayer::findDrumPreset(const std::string& path,
 
 void BassMidiPlayer::rebuildMelodyPresetCache(const std::string& path) {
     melodyPresetCache_.clear();
+    resolveCache_.clear();
     if (path.empty()) return;
 
     sf2::PhdrChunk phdr;
@@ -633,7 +637,37 @@ void BassMidiPlayer::rebuildMelodyPresetCache(const std::string& path) {
          static_cast<unsigned>(melodyPresetCache_.size()), path.c_str());
 }
 
+// Voice resolution scans every preset of the SF2 and, for the semantic step,
+// lower-cases each name and runs ~40 substring searches per preset. A Yamaha
+// SF2 can hold well over a thousand presets, and this ran on every Program
+// Change (a section change sends ~12) while holding the player mutex. The
+// result only depends on (bank, program, voice name) and the preset list, so
+// it is memoised; the memo is cleared whenever the preset list is rebuilt.
+// Callers hold mutex_.
 bool BassMidiPlayer::findMelodicPreset(
+    const std::string& path, int requestedBank, int requestedProgram,
+    const std::string& voiceName, int& sourceBank, int& sourceProgram,
+    std::string& matchedName) const {
+    if (path.empty() || melodyPresetCache_.empty()) return false;
+
+    const std::string key = std::to_string(requestedBank) + ":" +
+                            std::to_string(requestedProgram) + ":" + voiceName;
+    const auto hit = resolveCache_.find(key);
+    if (hit != resolveCache_.end()) {
+        sourceBank = hit->second.bank;
+        sourceProgram = hit->second.program;
+        matchedName = hit->second.name;
+        return true;
+    }
+    if (!findMelodicPresetUncached(path, requestedBank, requestedProgram, voiceName,
+                                   sourceBank, sourceProgram, matchedName)) {
+        return false;
+    }
+    resolveCache_.emplace(key, ResolvedPreset{sourceBank, sourceProgram, matchedName});
+    return true;
+}
+
+bool BassMidiPlayer::findMelodicPresetUncached(
     const std::string& path, int requestedBank, int requestedProgram,
     const std::string& voiceName, int& sourceBank, int& sourceProgram,
     std::string& matchedName) const {
@@ -910,7 +944,7 @@ void BassMidiPlayer::preloadCurrentPreset(int channel) {
         }
     }
 
-    LOGI("BASSMIDI preload ch=%d sf2bank=%d rawYamahaBank=%d midi=%d:%d prog=%d",
+    LOGV("BASSMIDI preload ch=%d sf2bank=%d rawYamahaBank=%d midi=%d:%d prog=%d",
          channel, sourceBank,
          state.drum ? 128 : (state.bankMsb * 128 + state.bankLsb),
          state.bankMsb, state.bankLsb, sourceProgram);
@@ -1012,7 +1046,7 @@ void BassMidiPlayer::setChannelPreset(int channel, int bank, int program, const 
                      channel, requestedBank14, requestedProgram, voiceName.c_str(),
                      sourceBank, sourceProgram, matchedName.c_str());
             } else {
-                LOGI("VOICE RESOLVE ch=%d exact bank=%d prog=%d '%s'",
+                LOGV("VOICE RESOLVE ch=%d exact bank=%d prog=%d '%s'",
                      channel, requestedBank14, requestedProgram, matchedName.c_str());
             }
             // Keep the requested Yamaha MSB/LSB as the destination.
@@ -1035,7 +1069,7 @@ void BassMidiPlayer::setChannelPreset(int channel, int bank, int program, const 
     send(channel, MIDI_EVENT_BANK_LSB, static_cast<DWORD>(state.bankLsb));
     send(channel, MIDI_EVENT_PROGRAM, static_cast<DWORD>(state.program));
 
-    LOGI("SET PRESET APPLIED ch=%d bank=%d lsb=%d prog=%d drum=%d",
+    LOGV("SET PRESET APPLIED ch=%d bank=%d lsb=%d prog=%d drum=%d",
          channel, state.bankMsb, state.bankLsb, state.program,
          state.drum ? 1 : 0);
 
@@ -1247,8 +1281,8 @@ std::string BassMidiPlayer::presetList() const {
 }
 
 void BassMidiPlayer::render(float* out, int numFrames) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!stream_) {
+    const HSTREAM stream = renderStream_.load(std::memory_order_acquire);
+    if (!stream) {
         std::fill(out, out + numFrames * 2, 0.0f);
         return;
     }
@@ -1256,10 +1290,11 @@ void BassMidiPlayer::render(float* out, int numFrames) {
     const DWORD wanted =
         static_cast<DWORD>(numFrames * 2 * sizeof(float));
     const DWORD got = BASS_ChannelGetData(
-        stream_, out, wanted | BASS_DATA_FLOAT);
+        stream, out, wanted | BASS_DATA_FLOAT);
 
     if (got == static_cast<DWORD>(-1)) {
-        LOGE("BASS_ChannelGetData failed error=%d", BASS_ErrorGetCode());
+        // No logging here: this is the realtime thread (the stream may simply
+        // have been freed by an SF2 unload).
         std::fill(out, out + numFrames * 2, 0.0f);
         return;
     }
@@ -1268,4 +1303,15 @@ void BassMidiPlayer::render(float* out, int numFrames) {
     if (samples < numFrames * 2) {
         std::fill(out + samples, out + numFrames * 2, 0.0f);
     }
+}
+
+bool BassMidiPlayer::degradeQuality() {
+    const HSTREAM stream = renderStream_.load(std::memory_order_acquire);
+    int level = interpolation_.load();
+    if (!stream || level <= 1) return false;
+    --level;
+    interpolation_.store(level);
+    BASS_ChannelSetAttribute(stream, BASS_ATTRIB_MIDI_SRC, static_cast<float>(level));
+    LOGI("PERF: render exceeded its time budget repeatedly -> BASSMIDI SRC quality lowered to %d", level);
+    return true;
 }

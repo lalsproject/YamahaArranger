@@ -31,28 +31,77 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import javax.inject.Inject
 
 object DebugLog {
-    private val _lines = ConcurrentLinkedQueue<String>()
-    private val _fullLines = ConcurrentLinkedQueue<String>()
+    // Ring buffer: add() is O(1) and allocation-light. The previous version used
+    // ConcurrentLinkedQueue.size() (O(n), n up to 30000) plus a new
+    // SimpleDateFormat on EVERY call - and it is called per note from the style
+    // sequencer thread, which produced audible timing hiccups.
     private const val MAX_LINES = 30
     private const val MAX_FULL_LINES = 30000
+    private val lock = Any()
+    private val times = LongArray(MAX_FULL_LINES)
+    private val messages = arrayOfNulls<String>(MAX_FULL_LINES)
+    private var head = 0     // next write index
+    private var count = 0
     @Volatile private var longText: String = ""
+
+    /**
+     * Per-note / per-event traces (NOTE_ON, raw MIDI in, voice cache hits...) are
+     * only recorded when this is true. They fire hundreds of times per bar, and
+     * building their strings alone costs more than the audio work they describe.
+     */
+    @JvmField @Volatile var verbose: Boolean = false
+
     @JvmStatic fun add(msg: String) {
-        val ts = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
-        val line = "[$ts] $msg"
-        _lines.add(line)
-        while (_lines.size > MAX_LINES) _lines.poll()
-        _fullLines.add(line)
-        while (_fullLines.size > MAX_FULL_LINES) _fullLines.poll()
+        val now = System.currentTimeMillis()
+        synchronized(lock) {
+            times[head] = now
+            messages[head] = msg
+            head = (head + 1) % MAX_FULL_LINES
+            if (count < MAX_FULL_LINES) count++
+        }
     }
     @JvmStatic fun traceAudio(msg: String) = add("🔊 AUDIO $msg")
     @JvmStatic fun traceMidi(msg: String) = add("📤 MIDI OUT $msg")
     @JvmStatic fun traceError(msg: String) = add("❌ ERROR $msg")
-    fun getAll(): List<String> = _lines.toList()
-    fun getFullAll(): List<String> = _fullLines.toList()
+
+    /** Records [msg] only in verbose mode; the lambda is not even invoked otherwise. */
+    inline fun verbose(msg: () -> String) { if (verbose) add(msg()) }
+
+    private fun formatTime(ms: Long): String {
+        val totalSec = ms / 1000
+        val millis = (ms % 1000).toInt()
+        val tz = java.util.TimeZone.getDefault().getOffset(ms) / 1000L
+        val local = totalSec + tz
+        val sod = ((local % 86400) + 86400) % 86400
+        val h = (sod / 3600).toInt(); val m = ((sod % 3600) / 60).toInt(); val sec = (sod % 60).toInt()
+        return String.format(Locale.US, "%02d:%02d:%02d.%03d", h, m, sec, millis)
+    }
+
+    private fun snapshot(maxLines: Int): List<String> {
+        var outTimes = LongArray(0)
+        var outMsgs = arrayOfNulls<String>(0)
+        synchronized(lock) {
+            val n = minOf(count, maxLines)
+            outTimes = LongArray(n)
+            outMsgs = arrayOfNulls(n)
+            for (i in 0 until n) {
+                val idx = ((head - n + i) % MAX_FULL_LINES + MAX_FULL_LINES) % MAX_FULL_LINES
+                outTimes[i] = times[idx]
+                outMsgs[i] = messages[idx]
+            }
+        }
+        // Timestamps are formatted lazily, only when somebody reads the log.
+        val out = ArrayList<String>(outTimes.size)
+        for (i in outTimes.indices) out.add("[" + formatTime(outTimes[i]) + "] " + outMsgs[i])
+        return out
+    }
+
+    fun getAll(): List<String> = snapshot(MAX_LINES)
+    fun getFullAll(): List<String> = snapshot(MAX_FULL_LINES)
     fun setLongText(text: String) { longText = text }
     fun getLongText(): String = longText
-    fun getFullText(): String = _fullLines.joinToString("\n")
-    fun clear() { _lines.clear(); _fullLines.clear(); longText = "" }
+    fun getFullText(): String = getFullAll().joinToString("\n")
+    fun clear() { synchronized(lock) { head = 0; count = 0; java.util.Arrays.fill(messages, null) }; longText = "" }
 }
 
 data class VoiceSlot(

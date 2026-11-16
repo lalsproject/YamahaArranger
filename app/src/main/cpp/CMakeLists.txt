@@ -17,6 +17,7 @@ set_target_properties(fluidsynth_assetloader PROPERTIES IMPORTED_LOCATION ${JNIL
 add_library(yamaha_arranger_native SHARED
     native_lib.cpp
     audio_engine.cpp
+    native_log.cpp
     bassmidi_player.cpp
     voice.cpp
     style_parser.cpp

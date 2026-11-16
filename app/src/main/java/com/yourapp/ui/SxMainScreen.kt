@@ -651,6 +651,7 @@ private fun SxNavBar(
 private fun SxEngineLogDialog(onDismiss: () -> Unit, onSaveAllLog: () -> Unit) {
     var logs by remember { mutableStateOf(listOf<String>()) }
     var filter by remember { mutableStateOf("ALL") }
+    var verbose by remember { mutableStateOf(DebugLog.verbose) }
     val context = androidx.compose.ui.platform.LocalContext.current
 
     LaunchedEffect(Unit) {
@@ -673,7 +674,7 @@ private fun SxEngineLogDialog(onDismiss: () -> Unit, onSaveAllLog: () -> Unit) {
         title = { Text("UTILITY  •  ENGINE LOG") },
         text = {
             Column(Modifier.fillMaxWidth().heightIn(max = 520.dp)) {
-                Text("Live engine/MIDI diagnostics. Full history is saved with SAVE ALL LOG.", color = SxDim, fontSize = 9.sp)
+                Text("Live engine/MIDI diagnostics. Full history is saved with SAVE ALL LOG. Per-note traces are off by default (smoother playback); turn VERBOSE on only while debugging.", color = SxDim, fontSize = 9.sp)
                 Spacer(Modifier.height(5.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                     listOf("ALL", "AUDIO", "MIDI", "CASM", "STRING", "ERROR").forEach { f ->
@@ -694,6 +695,9 @@ private fun SxEngineLogDialog(onDismiss: () -> Unit, onSaveAllLog: () -> Unit) {
         },
         dismissButton = {
             Row {
+                TextButton(onClick = { verbose = !verbose; DebugLog.verbose = verbose }) {
+                    Text(if (verbose) "VERBOSE ON" else "VERBOSE OFF", color = if (verbose) SxGreen else SxDim)
+                }
                 TextButton(onClick = { DebugLog.clear(); logs = emptyList() }) { Text("CLEAR") }
                 TextButton(onClick = {
                     onSaveAllLog()

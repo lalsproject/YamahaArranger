@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 import java.util.concurrent.atomic.AtomicLong
@@ -78,6 +79,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
         stop()
         channelOverrides.clear()
         appliedChannelStates.clear()
+        synchronized(scheduleCache) { scheduleCache.clear() }
         for (i in mixerStates.indices) mixerStates[i] = MixerState()
         lastAppliedSection = ""
         dynamicVoiceDirty = false
@@ -323,7 +325,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
             "▶ PLAY " + section.name + ": parts=" + section.parts.size + ", events=" + section.parts.sumOf { it.events.size } + ", noteEvents=" + noteCount + ", loopLimit=" + loopLimit + ", seamless=" + seamless
         )
 
-        playbackJob = scope.launch(Dispatchers.Default) {
+        playbackJob = scope.launch(playbackDispatcher) {
             var active = PendingSection(section, ppq, loopLimit, onComplete)
             active.onStart?.invoke()
             var remainingLoops = loopLimit
@@ -599,7 +601,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
                     )
                 }
             } else {
-                com.yourapp.yamahaarranger.ui.DebugLog.add("🎚 CASM AUDIO CACHE HIT dst$destination pc=$prog bank=$audioBank")
+                com.yourapp.yamahaarranger.ui.DebugLog.verbose { "🎚 CASM AUDIO CACHE HIT dst$destination pc=$prog bank=$audioBank" }
             }
             midiInputManager.sendProgramChange(destination, prog, midiMsb, midiLsb)
             applied += destination
@@ -758,6 +760,47 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
         val interruptedByTransition: Boolean
     )
 
+    private data class Scheduled(
+        val tick:Int,
+        val event:StyleNoteEvent,
+        val part:StylePartModel
+    )
+
+    // Identity-keyed on purpose: section models are large data classes and
+    // hashing/equality over all their events would cost more than rebuilding.
+    private val scheduleCache = java.util.IdentityHashMap<StyleSectionModel, List<Scheduled>>()
+
+    private fun scheduleFor(section:StyleSectionModel, phase:Long, sectionLength:Long): List<Scheduled> {
+        if (phase == 0L) synchronized(scheduleCache) { scheduleCache[section]?.let { return it } }
+        val built = section.parts
+            .flatMap{part->
+                part.events.map{e->
+                    val raw = e.tick.toLong().coerceAtLeast(0L)
+                    val relative = (raw - phase + sectionLength) % sectionLength
+                    Scheduled(relative.toInt(), e, part)
+                }
+            }
+            .sortedWith(compareBy<Scheduled>{it.tick}.thenBy{it.event.isNoteOn.not()})
+        if (phase == 0L) synchronized(scheduleCache) { scheduleCache[section] = built }
+        return built
+    }
+
+    private companion object {
+        // Dedicated high-priority thread for the style clock. On the shared
+        // Dispatchers.Default pool the note timing competed with UI/parsing work
+        // and drifted by several milliseconds (uneven, "stuttering" groove).
+        val playbackDispatcher: kotlinx.coroutines.CoroutineDispatcher by lazy {
+            java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                Thread({
+                    try {
+                        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+                    } catch (_: Throwable) {}
+                    r.run()
+                }, "StyleSequencer").apply { isDaemon = true }
+            }.asCoroutineDispatcher()
+        }
+    }
+
     private suspend fun playOnce(section:StyleSectionModel,ppq:Int,startAbsoluteTick:Long,phaseStartTick:Long,session:Long): PlayOnceResult {
         loopCount++
         if(section.lengthTicks<=0) return PlayOnceResult(startAbsoluteTick, false)
@@ -768,23 +811,12 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
             applyVoicesFromCasm(section)
         }
 
-        data class Scheduled(
-            val tick:Int,
-            val event:StyleNoteEvent,
-            val part:com.yourapp.yamahaarranger.style.StylePartModel
-        )
-
         val sectionLength = section.lengthTicks.coerceAtLeast(1).toLong()
         val phase = phaseStartTick.mod(sectionLength)
-        val merged=section.parts
-            .flatMap{part->
-                part.events.map{e->
-                    val raw = e.tick.toLong().coerceAtLeast(0L)
-                    val relative = (raw - phase + sectionLength) % sectionLength
-                    Scheduled(relative.toInt(), e, part)
-                }
-            }
-            .sortedWith(compareBy<Scheduled>{it.tick}.thenBy{it.event.isNoteOn.not()})
+        // Building + sorting every event of the section on each loop allocated
+        // thousands of objects right at the bar line (GC pause = late first
+        // beat). The schedule only depends on the section, so build it once.
+        val merged = scheduleFor(section, phase, sectionLength)
         if(merged.isEmpty()) return PlayOnceResult(startAbsoluteTick + sectionLength, false)
 
         val timelineStartNanos=masterClockStartedAtNanos
@@ -822,7 +854,8 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
             if(waitNanos>0L){
                 val waitMs=waitNanos/1_000_000L
                 if(waitMs>0L) delay(waitMs)
-                if(targetNanos-System.nanoTime()>0L) Thread.yield()
+                // delay() has 1 ms granularity: finish the last fraction precisely.
+                while(System.nanoTime()<targetNanos) Thread.yield()
             }
 
             val chord=currentChord
@@ -885,7 +918,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
 
             if(policy==null&&chord!=null&&s.event.isNoteOn&&!isRhythmSource(s.event.channel))continue
             if(s.event.isNoteOn&&isUnsupportedArticulation(policy)){
-                com.yourapp.yamahaarranger.ui.DebugLog.add("🔇 SUPPRESS " + (policy?.voiceName ?: "unknown") + " src" + s.event.channel + ":" + s.event.note + " (MegaVoice articulation unsupported by SF2)")
+                com.yourapp.yamahaarranger.ui.DebugLog.verbose { "🔇 SUPPRESS " + (policy?.voiceName ?: "unknown") + " src" + s.event.channel + ":" + s.event.note + " (MegaVoice articulation unsupported by SF2)" }
                 continue
             }
 
@@ -894,7 +927,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
                 emitIfCurrent(session){
                     val active=activeTransposedNotes.remove(key)
                     if(active!=null){
-                        if(active.destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.add("🎻 STRING NOTEOFF src"+active.sourceChannel+":"+active.sourceNote+" dst13 note="+active.outputNote)
+                        if(active.destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.verbose { "🎻 STRING NOTEOFF src"+active.sourceChannel+":"+active.sourceNote+" dst13 note="+active.outputNote }
                         audioEngine.noteOffChannel(active.destinationChannel,active.outputNote)
                         midiInputManager.sendNoteOff(active.destinationChannel,active.outputNote)
                     }
@@ -905,7 +938,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
             val sourceChannel=s.event.channel
             val destinationChannel=policy?.destinationChannel?:sourceChannel
             if(destinationChannel in 0..3){
-                com.yourapp.yamahaarranger.ui.DebugLog.add("  · style event src"+sourceChannel+":"+s.event.note+": SKIP dst"+destinationChannel+" (reserved for keyboard voices)")
+                com.yourapp.yamahaarranger.ui.DebugLog.verbose { "  · style event src"+sourceChannel+":"+s.event.note+": SKIP dst"+destinationChannel+" (reserved for keyboard voices)" }
                 continue
             }
             if(destinationChannel in lockedChannels)continue
@@ -916,7 +949,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
             emitIfCurrent(session){
                 val previousActive=activeTransposedNotes[key]
                 if(previousActive!=null){
-                    if(previousActive.destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.add("🎻 STRING REPLACE src"+previousActive.sourceChannel+":"+previousActive.sourceNote+" oldNote="+previousActive.outputNote)
+                    if(previousActive.destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.verbose { "🎻 STRING REPLACE src"+previousActive.sourceChannel+":"+previousActive.sourceNote+" oldNote="+previousActive.outputNote }
                     audioEngine.noteOffChannel(previousActive.destinationChannel,previousActive.outputNote)
                     midiInputManager.sendNoteOff(previousActive.destinationChannel,previousActive.outputNote)
                     activeTransposedNotes.remove(key)
@@ -934,8 +967,8 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
             if(policy!=null&&!isDrumPart){
                 val policyList=s.part.casmPolicies.ifEmpty{listOfNotNull(s.part.casm)}
                 activeTransposedNotes[key]=ActiveTransposedNote(sourceChannel,s.event.note,destinationChannel,note,velocity,policy,policyList)
-                if(destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.add("🎻 STRING NOTEON src"+sourceChannel+":"+s.event.note+" dst13 note="+note+" NTR="+(policy.ntr and 0x7f)+" NTT="+(policy.ntt and 0x7f)+" RTR="+(policy.rtr and 0x7f))
-                if(destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.add("🎼 CASM SELECT src"+sourceChannel+":"+s.event.note+" chord="+chord?.rootNote+"/"+chord?.quality+" → dst"+destinationChannel+" NTR="+(policy.ntr and 0x7f)+" NTT="+(policy.ntt and 0x7f)+" SRC="+policy.sourceChordRoot+"/"+policy.sourceChordType+" range="+policy.sourceNoteLow+"-"+policy.sourceNoteHigh+" RTR="+(policy.rtr and 0x7f))
+                if(destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.verbose { "🎻 STRING NOTEON src"+sourceChannel+":"+s.event.note+" dst13 note="+note+" NTR="+(policy.ntr and 0x7f)+" NTT="+(policy.ntt and 0x7f)+" RTR="+(policy.rtr and 0x7f) }
+                if(destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.verbose { "🎼 CASM SELECT src"+sourceChannel+":"+s.event.note+" chord="+chord?.rootNote+"/"+chord?.quality+" → dst"+destinationChannel+" NTR="+(policy.ntr and 0x7f)+" NTT="+(policy.ntt and 0x7f)+" SRC="+policy.sourceChordRoot+"/"+policy.sourceChordType+" range="+policy.sourceNoteLow+"-"+policy.sourceNoteHigh+" RTR="+(policy.rtr and 0x7f) }
             }
 
             audioEngine.noteOnChannel(destinationChannel,note,velocity/127f)

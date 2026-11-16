@@ -186,7 +186,7 @@ class AudioEngineManager @Inject constructor(
     }
 
     fun noteOn(midiNote: Int, velocity01: Float) {
-        DebugLog.traceAudio("NOTE_ON ch=legacy note=$midiNote vel=${"%.3f".format(java.util.Locale.US, velocity01)} sf2=$soundFontLoaded")
+        DebugLog.verbose { "🔊 AUDIO NOTE_ON ch=legacy note=$midiNote vel=$velocity01 sf2=$soundFontLoaded" }
         if (soundFontLoaded) bridge.nativeSfNoteOnChannel(0, midiNote, velocity01)
         else {
             val sample = sampleProvider.sampleForNote(midiNote) ?: return
@@ -195,18 +195,18 @@ class AudioEngineManager @Inject constructor(
     }
 
     fun noteOff(midiNote: Int) {
-        DebugLog.traceAudio("NOTE_OFF ch=legacy note=$midiNote sf2=$soundFontLoaded")
+        DebugLog.verbose { "🔊 AUDIO NOTE_OFF ch=legacy note=$midiNote sf2=$soundFontLoaded" }
         if (soundFontLoaded) bridge.nativeSfNoteOffChannel(0, midiNote) else bridge.nativeNoteOff(midiNote)
     }
 
     fun noteOnChannel(channel: Int, midiNote: Int, velocity01: Float) {
-        DebugLog.traceAudio("NOTE_ON ch=$channel note=$midiNote vel=${"%.3f".format(java.util.Locale.US, velocity01)} sf2=$soundFontLoaded")
+        DebugLog.verbose { "🔊 AUDIO NOTE_ON ch=$channel note=$midiNote vel=$velocity01 sf2=$soundFontLoaded" }
         if (soundFontLoaded) bridge.nativeSfNoteOnChannel(channel, midiNote, velocity01)
         else noteOn(midiNote, velocity01)
     }
 
     fun noteOffChannel(channel: Int, midiNote: Int) {
-        DebugLog.traceAudio("NOTE_OFF ch=$channel note=$midiNote sf2=$soundFontLoaded")
+        DebugLog.verbose { "🔊 AUDIO NOTE_OFF ch=$channel note=$midiNote sf2=$soundFontLoaded" }
         if (soundFontLoaded) bridge.nativeSfNoteOffChannel(channel, midiNote)
         else noteOff(midiNote)
     }
@@ -287,7 +287,6 @@ class AudioEngineManager @Inject constructor(
 
     // Named overload carries the Yamaha/CASM voice identity into BASSMIDI resolution.
     fun setChannelProgram(channel: Int, program: Int, bank: Int = 0, voiceName: String? = null) {
-        DebugLog.traceAudio("PROGRAM ch=$channel bank=$bank program=$program voice=${voiceName ?: ""}")
         if (voiceName.isNullOrBlank()) {
             bridge.nativeSetChannelPreset(channel, bank, program)
         } else {
