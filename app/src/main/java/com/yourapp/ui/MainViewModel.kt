@@ -12,6 +12,7 @@ import com.yourapp.yamahaarranger.style.StyleRepository
 import com.yourapp.yamahaarranger.style.StyleChannelOverride
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -575,8 +576,14 @@ class MainViewModel @Inject constructor(
         }
     }
 
+    private var styleLoadJob: Job? = null
+
     fun onStyleFilePicked(uri: Uri) {
-        viewModelScope.launch {
+        // A second pick must win over a still-parsing first one, and the old
+        // style must go silent immediately instead of when parsing finishes.
+        styleLoadJob?.cancel()
+        arrangerBrain.stopForStyleChange()
+        styleLoadJob = viewModelScope.launch {
             val bytes = withContext(Dispatchers.IO) { contentResolver.readBytes(uri) }
             if (bytes == null) { DebugLog.add("❌ Cannot read style"); return@launch }
             // Prefer the actual URI/path filename. Some Android providers expose

@@ -46,7 +46,45 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
         val program: Int, val bank: Int, val volume: Int, val pan: Int,
         val expression: Int, val reverbSend: Int, val chorusSend: Int
     )
-    private val appliedChannelStates = mutableMapOf<Int, AppliedChannelState>()
+    // Written by the playback thread and cleared from the UI thread.
+    private val appliedChannelStates = java.util.concurrent.ConcurrentHashMap<Int, AppliedChannelState>()
+
+    // Every start/stop of the style opens a new "session". All audio output of the
+    // playback coroutine goes through emitIfCurrent(), which re-checks the session
+    // under a lock. stop() bumps the session under the same lock, so after stop()
+    // returns a still-running old coroutine can never emit another note
+    // (previously one late note-on after allNotesOff = a note that never stopped).
+    private val emitLock = Any()
+    @Volatile private var sessionId = 0L
+    // Program changes that happen INSIDE a section (dynamic PC) change the native
+    // channel voice; the section's own voices are re-applied when the loop restarts.
+    @Volatile private var dynamicVoiceDirty = false
+    // Native channel state is lost when a SoundFont is (re)loaded.
+    @Volatile private var appliedVoiceEpoch = -1
+
+    private inline fun emitIfCurrent(session: Long, block: () -> Unit) {
+        synchronized(emitLock) {
+            if (session != sessionId) throw kotlinx.coroutines.CancellationException("style session ended")
+            block()
+        }
+    }
+
+    /**
+     * Called when a different style is loaded: nothing of the previous style
+     * (running section, per-channel voice overrides, cached channel programs,
+     * mixer values) may leak into the new one.
+     */
+    fun resetForNewStyle() {
+        stop()
+        channelOverrides.clear()
+        appliedChannelStates.clear()
+        for (i in mixerStates.indices) mixerStates[i] = MixerState()
+        lastAppliedSection = ""
+        dynamicVoiceDirty = false
+        loopCount = 0
+        clearStringTrace()
+        com.yourapp.yamahaarranger.ui.DebugLog.add("🎼 Sequencer reset for new style")
+    }
 
     private data class MixerState(
         var volume: Int = 127,
@@ -266,8 +304,10 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
         seamless: Boolean
     ) {
         if (!seamless) clearStringTrace()
+        val session = synchronized(emitLock) { ++sessionId }
         pendingSectionQueue.clear()
         pendingTransition = null
+        dynamicVoiceDirty = false
         masterClockStartedAtNanos = System.nanoTime()
         masterTimelineTick = 0L
         barClockStartedAtNanos = masterClockStartedAtNanos
@@ -288,7 +328,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
             active.onStart?.invoke()
             var remainingLoops = loopLimit
             while (true) {
-                val result = playOnce(active.section, active.ppq, masterTimelineTick, 0L)
+                val result = playOnce(active.section, active.ppq, masterTimelineTick, 0L, session)
                 masterTimelineTick = result.endTick
                 barClockStartedAtNanos = masterClockStartedAtNanos
 
@@ -361,17 +401,27 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
     }
 
     fun stop(){
-        pendingSectionQueue.clear()
-        pendingTransition = null
+        // Close the session first and silence everything under the emit lock:
+        // an old coroutine that is still unwinding is rejected by emitIfCurrent().
+        synchronized(emitLock){
+            sessionId++
+            pendingSectionQueue.clear()
+            pendingTransition = null
+            activeTransposedNotes.clear()
+            audioEngine.allNotesOff()
+            midiInputManager.allNotesOff()
+        }
         playbackJob?.cancel()
         playbackJob=null
         masterClockStartedAtNanos=0L
         masterTimelineTick=0L
         barClockStartedAtNanos=0L
+        // The same section may be started again (Start/Stop). Dynamic program
+        // changes could have left other voices on the channels, so force the
+        // section voices to be applied again (cached identical states are skipped).
+        lastAppliedSection = ""
+        dynamicVoiceDirty = false
         if(stringTraceEnabled && synchronized(stringTraceLock){stringTrace.isNotEmpty()}) dumpStringTrace()
-        audioEngine.allNotesOff()
-        midiInputManager.allNotesOff()
-        activeTransposedNotes.clear()
         com.yourapp.yamahaarranger.ui.DebugLog.add("⏹ STOP")
     }
 
@@ -467,6 +517,13 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
 
     private fun applyVoicesFromCasm(section:StyleSectionModel) {
         val startedAtNanos = System.nanoTime()
+        // A (re)loaded SoundFont resets the native channels; cached "already applied"
+        // states are no longer true and would skip the program change.
+        val epoch = audioEngine.soundFontEpoch
+        if (epoch != appliedVoiceEpoch) {
+            appliedChannelStates.clear()
+            appliedVoiceEpoch = epoch
+        }
         com.yourapp.yamahaarranger.ui.DebugLog.add("⏱ CASM VOICE APPLY START section=${section.name}")
         val explicitByDestination = linkedMapOf<Int, StylePartModel>()
         section.parts.forEach { part ->
@@ -701,9 +758,15 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
         val interruptedByTransition: Boolean
     )
 
-    private suspend fun playOnce(section:StyleSectionModel,ppq:Int,startAbsoluteTick:Long,phaseStartTick:Long): PlayOnceResult {
+    private suspend fun playOnce(section:StyleSectionModel,ppq:Int,startAbsoluteTick:Long,phaseStartTick:Long,session:Long): PlayOnceResult {
         loopCount++
         if(section.lengthTicks<=0) return PlayOnceResult(startAbsoluteTick, false)
+        // A dynamic program change in the previous loop left the channel on a
+        // different voice; start this loop from the section's own voices again.
+        if (dynamicVoiceDirty) {
+            dynamicVoiceDirty = false
+            applyVoicesFromCasm(section)
+        }
 
         data class Scheduled(
             val tick:Int,
@@ -753,6 +816,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
                 break
             }
             lastProcessedTick = absoluteTick
+            if (session != sessionId) throw kotlinx.coroutines.CancellationException("style session ended")
             val targetNanos=timelineStartNanos+(absoluteTick*nanosPerTick).toLong()
             val waitNanos=targetNanos-System.nanoTime()
             if(waitNanos>0L){
@@ -802,8 +866,14 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
                         val msb = if (drum) 127 else (bank ushr 7).coerceIn(0, 127)
                         val lsb = if (drum) 0 else (bank and 0x7f)
                         val program = s.event.note.coerceIn(0, 127)
-                        audioEngine.setChannelProgram(destination, program, bank)
-                        midiInputManager.sendProgramChange(destination, program, msb, lsb)
+                        emitIfCurrent(session) {
+                            audioEngine.setChannelProgram(destination, program, bank)
+                            midiInputManager.sendProgramChange(destination, program, msb, lsb)
+                            // The cached "applied" state is now wrong; without this the
+                            // next section start hit the cache and never restored the voice.
+                            appliedChannelStates.remove(destination)
+                            dynamicVoiceDirty = true
+                        }
                         com.yourapp.yamahaarranger.ui.DebugLog.add(
                             "DYNAMIC PC src" + s.event.channel + " -> dst" + destination +
                                 " PC=" + program + " bank=" + msb + ":" + lsb + " SFbank=" + bank
@@ -821,11 +891,13 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
 
             if(!s.event.isNoteOn){
                 val key=s.event.channel.toString()+":"+s.event.note
-                val active=activeTransposedNotes.remove(key)
-                if(active!=null){
-                    if(active.destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.add("🎻 STRING NOTEOFF src"+active.sourceChannel+":"+active.sourceNote+" dst13 note="+active.outputNote)
-                    audioEngine.noteOffChannel(active.destinationChannel,active.outputNote)
-                    midiInputManager.sendNoteOff(active.destinationChannel,active.outputNote)
+                emitIfCurrent(session){
+                    val active=activeTransposedNotes.remove(key)
+                    if(active!=null){
+                        if(active.destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.add("🎻 STRING NOTEOFF src"+active.sourceChannel+":"+active.sourceNote+" dst13 note="+active.outputNote)
+                        audioEngine.noteOffChannel(active.destinationChannel,active.outputNote)
+                        midiInputManager.sendNoteOff(active.destinationChannel,active.outputNote)
+                    }
                 }
                 continue
             }
@@ -841,12 +913,14 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
             if(channelOverride?.muted==true)continue
 
             val key=sourceChannel.toString()+":"+s.event.note
-            val previousActive=activeTransposedNotes[key]
-            if(previousActive!=null){
-                if(previousActive.destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.add("🎻 STRING REPLACE src"+previousActive.sourceChannel+":"+previousActive.sourceNote+" oldNote="+previousActive.outputNote)
-                audioEngine.noteOffChannel(previousActive.destinationChannel,previousActive.outputNote)
-                midiInputManager.sendNoteOff(previousActive.destinationChannel,previousActive.outputNote)
-                activeTransposedNotes.remove(key)
+            emitIfCurrent(session){
+                val previousActive=activeTransposedNotes[key]
+                if(previousActive!=null){
+                    if(previousActive.destinationChannel==13)com.yourapp.yamahaarranger.ui.DebugLog.add("🎻 STRING REPLACE src"+previousActive.sourceChannel+":"+previousActive.sourceNote+" oldNote="+previousActive.outputNote)
+                    audioEngine.noteOffChannel(previousActive.destinationChannel,previousActive.outputNote)
+                    midiInputManager.sendNoteOff(previousActive.destinationChannel,previousActive.outputNote)
+                    activeTransposedNotes.remove(key)
+                }
             }
 
             val isDrumPart=destinationChannel==9||(policy!=null&&isDrumVoice(policy.voiceName))
@@ -856,6 +930,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
             val note=((transformed?:continue)+(channelOverride?.transpose?:0)).coerceIn(0,127)
             val velocity=s.event.velocity.coerceIn(1,127)
 
+            emitIfCurrent(session){
             if(policy!=null&&!isDrumPart){
                 val policyList=s.part.casmPolicies.ifEmpty{listOfNotNull(s.part.casm)}
                 activeTransposedNotes[key]=ActiveTransposedNote(sourceChannel,s.event.note,destinationChannel,note,velocity,policy,policyList)
@@ -865,6 +940,7 @@ class StyleSequencer(private val audioEngine: AudioEngineManager, private val mi
 
             audioEngine.noteOnChannel(destinationChannel,note,velocity/127f)
             midiInputManager.sendNoteOn(destinationChannel,note,velocity)
+            }
         }
         val naturalEnd = startAbsoluteTick + section.lengthTicks.coerceAtLeast(0).toLong()
         return if (interruptedByTransition) {

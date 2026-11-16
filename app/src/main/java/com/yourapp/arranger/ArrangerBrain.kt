@@ -119,13 +119,40 @@ class ArrangerBrain @Inject constructor(
         }
     }
 
+    /** Silence the running style right away (e.g. when the user picks another style file). */
+    fun stopForStyleChange() {
+        pendingTransitionJob?.cancel()
+        pendingChordJob?.cancel()
+        pendingChord = null
+        if (::sequencer.isInitialized) sequencer.stop()
+        _state.update { it.copy(isPlaying = false) }
+    }
+
     fun loadStyle(style: ParsedStyle) {
-        loadedStyle = style
         ensureSequencer()
+        // The previous style must not keep playing, and none of its state
+        // (running section, voice overrides, cached programs, mixer values) may
+        // carry over into the new style. Previously loadStyle only swapped the
+        // data: the old section kept looping and isPlaying stayed true.
+        pendingTransitionJob?.cancel()
+        pendingChordJob?.cancel()
+        pendingChord = null
+        sequencer.resetForNewStyle()
+
+        loadedStyle = style
+        // Keep the current Main variation if the new style has it, else the first Main it has.
+        val keep = _state.value.currentSection
+            .takeIf { it in mainVariations && style.sections.containsKey(it.styleName) }
+        val start = keep ?: mainVariations.sortedBy { it.ordinal }
+            .firstOrNull { style.sections.containsKey(it.styleName) } ?: ArrangerSection.MainA
+        activeSection = start
+        currentPlayingSection = start
+        pendingMainTarget = null
+
         sequencer.tempoBpm = style.defaultTempoBpm
         sequencer.setVoiceMap(style.voiceMap)
-        _state.update { it.copy(tempoBpm = style.defaultTempoBpm) }
-        Timber.i("Style loaded: ${style.fileName}, voices=${style.voiceMap.size}")
+        _state.update { it.copy(tempoBpm = style.defaultTempoBpm, isPlaying = false, currentSection = start) }
+        Timber.i("Style loaded: ${style.fileName}, voices=${style.voiceMap.size}, start=${start.styleName}")
     }
 
     fun setKeyboardReleaseTime(value: Int) {

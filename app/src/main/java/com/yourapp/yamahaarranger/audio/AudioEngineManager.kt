@@ -21,6 +21,10 @@ class AudioEngineManager @Inject constructor(
 
     @Volatile private var loggerReady = false
 
+    /** Incremented on every SoundFont (re)load/unload; native channel programs are reset by those. */
+    @Volatile var soundFontEpoch = 0
+        private set
+
     /**
      * Native BASSMIDI errors (bad file, no permission, out of memory...) are
      * reported through DebugLog. The logger used to be initialised only in
@@ -65,6 +69,7 @@ class AudioEngineManager @Inject constructor(
      */
     fun loadSoundFont(filePath: String): Boolean {
         ensureLogger()
+        soundFontEpoch++
         val role = if (nextSoundFontRole == 0) "MELODY" else "DRUM"
         DebugLog.add("🎼 Loading $role SF2…")
         DebugLog.traceAudio("SF2 LOAD role=$role path=$filePath")
@@ -104,6 +109,7 @@ class AudioEngineManager @Inject constructor(
 
     fun loadMelodySoundFont(filePath: String): Boolean {
         ensureLogger()
+        soundFontEpoch++
         val ok = runBlocking { soundFontOperationMutex.withLock { withAudioStreamPausedUnsafe { bridge.nativeLoadMelodySoundFont(filePath) } } }
         soundFontLoaded = soundFontLoaded || ok
         if (ok) DebugLog.add("✅ MELODY SF2 OK") else DebugLog.add("❌ MELODY SF2 FAILED")
@@ -112,6 +118,7 @@ class AudioEngineManager @Inject constructor(
 
     fun loadDrumSoundFont(filePath: String): Boolean {
         ensureLogger()
+        soundFontEpoch++
         val ok = runBlocking { soundFontOperationMutex.withLock { withAudioStreamPausedUnsafe { bridge.nativeLoadDrumSoundFont(filePath) } } }
         soundFontLoaded = soundFontLoaded || ok
         if (ok) DebugLog.add("✅ DRUM SF2 OK") else DebugLog.add("❌ DRUM SF2 FAILED")
@@ -124,6 +131,7 @@ class AudioEngineManager @Inject constructor(
      */
     fun loadSoundFontPair(melodyPath: String, drumPath: String): Boolean {
         ensureLogger()
+        soundFontEpoch++
         val result = runBlocking { soundFontOperationMutex.withLock { withAudioStreamPausedUnsafe {
             val melodyOk = bridge.nativeLoadMelodySoundFont(melodyPath)
             if (!melodyOk) return@withAudioStreamPausedUnsafe false
@@ -146,6 +154,7 @@ class AudioEngineManager @Inject constructor(
      */
     fun loadSingleSoundFont(filePath: String): Boolean {
         ensureLogger()
+        soundFontEpoch++
         val result = runBlocking { soundFontOperationMutex.withLock { withAudioStreamPausedUnsafe {
             val melodyOk = bridge.nativeLoadMelodySoundFont(filePath)
             if (!melodyOk) return@withAudioStreamPausedUnsafe false
@@ -168,6 +177,7 @@ class AudioEngineManager @Inject constructor(
     fun isSoundFontLoaded(): Boolean = soundFontLoaded
 
     fun unloadSoundFont() {
+        soundFontEpoch++
         DebugLog.traceAudio("SF2 UNLOAD")
         runBlocking { soundFontOperationMutex.withLock { withAudioStreamPausedUnsafe { bridge.nativeUnloadSoundFont() } } }
         soundFontLoaded = false
