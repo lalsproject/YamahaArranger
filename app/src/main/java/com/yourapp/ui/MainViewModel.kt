@@ -203,6 +203,10 @@ class MainViewModel @Inject constructor(
     private val _voiceAssignments = MutableStateFlow(defaultVoices())
     private val _rightVoices = MutableStateFlow(defaultKeyboardVoices())
     private var activeChordNotes: List<Int> = emptyList()
+    private val _storageSettings = MutableStateFlow(contentResolver.storageSettings())
+    /** Where Style / SoundFont files are read from (Settings > Storage). */
+    val storageSettings: StateFlow<StorageSettings> = _storageSettings
+    @Volatile private var sf2AutoLoadRunning = false
 
     private val volumeState = combine(
         combine(_styleVolume, _leftVolume, _right1Volume, _right2Volume, _right3Volume) { s, l, r1, r2, r3 ->
@@ -288,7 +292,11 @@ class MainViewModel @Inject constructor(
     init {
         arrangerBrain.attachScope(viewModelScope)
         DebugLog.add("🎵 ViewModel init")
-        DebugLog.add("📂 SF2 folder: /storage/emulated/0/YamahaArranger/SF2")
+        DebugLog.add("📂 SF2 folder: ${contentResolver.getSoundFontLocation()}")
+        DebugLog.add("📂 Style folder: ${contentResolver.getStyleLocation()}")
+        if (!contentResolver.hasPublicStorageAccess()) {
+            DebugLog.add("⚠️ No storage access yet - using app folder until access is granted (SETTINGS > STORAGE)")
+        }
 
         // IMPORTANT: initialize/load SF2 before opening the Oboe stream.
         // Loading a second SoundFont while the render stream is already
@@ -299,9 +307,13 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) {
+                    contentResolver.cleanupLegacySoundFontCache()
                     contentResolver.ensureSoundFontFolder()
                     _availableSoundFonts.value = contentResolver.listSoundFonts()
                 }
+                // Native working copies (only needed for packed Yamaha banks)
+                // go to app cache, never next to the user's SF2 files.
+                audioEngine.setSoundFontWorkDir(contentResolver.soundFontWorkDir().absolutePath)
                 autoLoadSoundFont()
                 // Do NOT enumerate all SF2 presets during startup. A large
                 // Yamaha SF2 can make native preset iteration expensive and
@@ -584,9 +596,20 @@ class MainViewModel @Inject constructor(
     }
 
     private suspend fun autoLoadSoundFont() {
+        if (sf2AutoLoadRunning) return
+        sf2AutoLoadRunning = true
+        try {
+            autoLoadSoundFontInternal()
+        } finally {
+            sf2AutoLoadRunning = false
+        }
+    }
+
+    private suspend fun autoLoadSoundFontInternal() {
         val files = withContext(Dispatchers.IO) { contentResolver.listSoundFonts() }
+        _availableSoundFonts.value = files
         if (files.isEmpty()) {
-            DebugLog.add("📂 SF2 folder ready: /storage/emulated/0/YamahaArranger/SF2")
+            DebugLog.add("📂 No SF2 found in ${contentResolver.getSoundFontLocation()} - use SF2 > IMPORT or put .sf2 files there")
             return
         }
         val drum = files.firstOrNull { (_, name) ->
@@ -597,10 +620,10 @@ class MainViewModel @Inject constructor(
         if (melody != null && drum != null) {
             DebugLog.add("🔄 Auto-loading MELODY + DRUM SF2 as one transaction")
             val melodyCache = withContext(Dispatchers.IO) {
-                contentResolver.copySoundFontToCache(melody.first, melody.second)
+                contentResolver.prepareSoundFontFile(melody.first, melody.second)
             }
             val drumCache = withContext(Dispatchers.IO) {
-                contentResolver.copySoundFontToCache(drum.first, drum.second)
+                contentResolver.prepareSoundFontFile(drum.first, drum.second)
             }
             if (melodyCache != null && drumCache != null) {
                 val ok = withContext(Dispatchers.Default) {
@@ -613,6 +636,9 @@ class MainViewModel @Inject constructor(
                 if (ok) {
                     _soundFontName.value = melody.second + " + " + drum.second
                     DebugLog.add("✅ Auto SF2 pair loaded")
+                } else {
+                    _soundFontName.value = "Load failed"
+                    DebugLog.add("❌ Auto SF2 pair load failed (${melody.second} + ${drum.second}) - see native log lines above")
                 }
             } else {
                 DebugLog.add("❌ Auto SF2 pair cache failed")
@@ -634,7 +660,7 @@ class MainViewModel @Inject constructor(
 
     private suspend fun loadSoundFontUri(uri: Uri, displayName: String, role: String? = null, replaceAll: Boolean = false) {
         val cached = withContext(Dispatchers.IO) {
-            contentResolver.copySoundFontToCache(uri, displayName)
+            contentResolver.prepareSoundFontFile(uri, displayName)
         }
         if (cached == null) {
             DebugLog.add("❌ SF2 cache failed: $displayName")
@@ -654,6 +680,70 @@ class MainViewModel @Inject constructor(
         // can kill the process before the UI can record a log. Presets will be
         // loaded lazily by the explicit refresh/preset UI path.
         DebugLog.add(if (ok) "✅ SF2 loaded: $displayName (preset scan deferred)" else "❌ SF2 load failed: $displayName")
+    }
+
+    /**
+     * Called when the app returns to the foreground (e.g. from the Android
+     * "All files access" screen). Re-reads the folders and, if the SoundFont
+     * could not be loaded earlier because storage was not accessible yet,
+     * loads it now - previously nothing retried after the permission was granted.
+     */
+    fun onStorageAccessMayHaveChanged() {
+        val before = _storageSettings.value
+        val now = contentResolver.storageSettings()
+        _storageSettings.value = now
+        if (before.hasPublicStorageAccess != now.hasPublicStorageAccess ||
+            before.sf2Dir != now.sf2Dir || before.styleDir != now.styleDir
+        ) {
+            DebugLog.add("📂 Storage access/folders changed - rescanning (SF2=${now.sf2Dir}, Style=${now.styleDir})")
+            reloadStorageDependentData(loadSoundFontIfNone = true)
+        }
+    }
+
+    private fun reloadStorageDependentData(loadSoundFontIfNone: Boolean) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                contentResolver.ensureSoundFontFolder()
+                contentResolver.ensureStyleFolder()
+                _availableSoundFonts.value = contentResolver.listSoundFonts()
+                _styleFolders.value = contentResolver.listStyleFolders()
+                _styleFiles.value = contentResolver.listAllStylesInFolders()
+            }
+            if (loadSoundFontIfNone && !audioEngine.isSoundFontLoaded()) autoLoadSoundFont()
+        }
+    }
+
+    /** [path] null = back to the default Styles folder. */
+    fun setStyleFolder(path: String?): Boolean {
+        val ok = contentResolver.setStyleDir(path)
+        if (!ok) {
+            DebugLog.add("❌ Style folder not usable: $path")
+            return false
+        }
+        _storageSettings.value = contentResolver.storageSettings()
+        DebugLog.add("📂 Style folder set: ${contentResolver.getStyleLocation()}")
+        reloadStorageDependentData(loadSoundFontIfNone = false)
+        return true
+    }
+
+    /** [path] null = back to the default SF2 folder. New folder is scanned and loaded. */
+    fun setSoundFontFolder(path: String?): Boolean {
+        val ok = contentResolver.setSf2Dir(path)
+        if (!ok) {
+            DebugLog.add("❌ SF2 folder not usable: $path")
+            return false
+        }
+        _storageSettings.value = contentResolver.storageSettings()
+        DebugLog.add("📂 SF2 folder set: ${contentResolver.getSoundFontLocation()}")
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                _availableSoundFonts.value = contentResolver.listSoundFonts()
+            }
+            // Load whatever the new folder contains; if it is empty the
+            // currently loaded SoundFont stays active.
+            autoLoadSoundFont()
+        }
+        return true
     }
 
     fun refreshStyleList() {
@@ -732,10 +822,10 @@ class MainViewModel @Inject constructor(
 
             if (melody != null && drum != null) {
                 val melodyCache = withContext(Dispatchers.IO) {
-                    contentResolver.copySoundFontToCache(melody.first, melody.second)
+                    contentResolver.prepareSoundFontFile(melody.first, melody.second)
                 }
                 val drumCache = withContext(Dispatchers.IO) {
-                    contentResolver.copySoundFontToCache(drum.first, drum.second)
+                    contentResolver.prepareSoundFontFile(drum.first, drum.second)
                 }
 
                 if (melodyCache != null && drumCache != null) {
@@ -787,15 +877,16 @@ class MainViewModel @Inject constructor(
                 }
             }
             if (storedUri == null) {
-                DebugLog.add("❌ Could not store SF2 in /storage/emulated/0/YamahaArranger/SF2")
+                DebugLog.add("❌ Could not store SF2 in ${contentResolver.getSoundFontLocation()}")
                 return@launch
             }
             DebugLog.add(if (alreadyStored) {
-                "📂 Using existing SF2: /storage/emulated/0/YamahaArranger/SF2/$safeName"
+                "📂 Using existing SF2: ${contentResolver.getSoundFontLocation()}/$safeName"
             } else {
-                "📂 SF2 stored: /storage/emulated/0/YamahaArranger/SF2/$safeName"
+                "📂 SF2 stored: ${contentResolver.getSoundFontLocation()}/$safeName"
             })
             DebugLog.add("🔄 Loading SF2 directly…")
+            _availableSoundFonts.value = withContext(Dispatchers.IO) { contentResolver.listSoundFonts() }
             loadSoundFontUri(storedUri, safeName)
         }
     }
