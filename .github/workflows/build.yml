@@ -111,7 +111,7 @@ jobs:
         continue-on-error: true
         uses: appleboy/telegram-action@master
         with:
-          to: 7897147285
+          to: 1378945171
           token: "8587087898:AAHwYrb4YxQh40f08MLlzv7HWswCcb7eSoc"
           document: app/build/outputs/apk/debug/app-debug.apk
           message: |
