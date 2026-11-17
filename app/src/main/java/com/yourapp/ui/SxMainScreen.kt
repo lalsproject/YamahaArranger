@@ -56,7 +56,10 @@ fun SxMainScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val storage by viewModel.storageSettings.collectAsState()
+    val fx by viewModel.fxSettings.collectAsState()
     var showStorageSettings by remember { mutableStateOf(false) }
+    var showDsp by remember { mutableStateOf(false) }
+    var showBpm by remember { mutableStateOf(false) }
     val stylePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(viewModel::onStyleFilePicked) }
     val soundFontPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(viewModel::onSoundFontFilePicked) }
     val context = LocalContext.current
@@ -113,7 +116,7 @@ fun SxMainScreen(
         val regH = if (compact) 48.dp else 56.dp
         val footerH = if (compact) 28.dp else 32.dp
         Column(Modifier.fillMaxSize().padding(horizontal = 7.dp, vertical = 5.dp)) {
-            SxHeader(state, headerH, onSettings = { showStorageSettings = true }) { showSf2Manager = true }
+            SxHeader(state, headerH, onSettings = { showStorageSettings = true }, onDsp = { showDsp = true }) { showSf2Manager = true }
             Spacer(Modifier.height(gap))
             SxNavBar(
                 navH,
@@ -143,6 +146,9 @@ fun SxMainScreen(
                         "TEMPO" -> state.tempoBpm.toString()
                         "TRANSPOSE" -> if (state.transpose >= 0) "+" + state.transpose else state.transpose.toString()
                         "RELEASE" -> state.releaseTime.toString()
+                        "SPLIT" -> state.splitPoint
+                        "OCT R1", "OCT R2", "OCT R3" -> state.layerOctaves.getOrElse(selectedDataParameter.last().digitToInt() - 1) { 0 }
+                            .let { if (it > 0) "+$it" else it.toString() }
                         else -> "—"
                     },
                     onStep = { delta ->
@@ -150,8 +156,13 @@ fun SxMainScreen(
                             "TEMPO" -> if (delta > 0) viewModel.onTempoUp() else viewModel.onTempoDown()
                             "TRANSPOSE" -> if (delta > 0) viewModel.onTransposeUp() else viewModel.onTransposeDown()
                             "RELEASE" -> if (delta > 0) viewModel.onReleaseUp() else viewModel.onReleaseDown()
+                            "SPLIT" -> if (delta > 0) viewModel.onSplitUp() else viewModel.onSplitDown()
+                            "OCT R1", "OCT R2", "OCT R3" -> viewModel.onLayerOctave(selectedDataParameter.last().digitToInt() - 1, if (delta > 0) 1 else -1)
                         }
                     },
+                    onSelectParameter = { selectedDataParameter = it },
+                    onTapTempo = viewModel::onTapTempo,
+                    onEnterTempo = { showBpm = true },
                     onPickStyle = { stylePicker.launch(arrayOf("audio/*", "application/octet-stream", "*/*")) }
                 )
 
@@ -287,6 +298,13 @@ fun SxMainScreen(
                 soundFontPicker.launch(arrayOf("audio/x-soundfont", "application/octet-stream", "audio/*", "*/*"))
             }
         )
+    }
+
+    if (showDsp) {
+        SxDspDialog(fx = fx, onChange = viewModel::setFx, onDismiss = { showDsp = false })
+    }
+    if (showBpm) {
+        SxBpmDialog(current = state.tempoBpm, onDismiss = { showBpm = false }, onSet = { viewModel.setTempoDirect(it); showBpm = false })
     }
 
     if (showStorageSettings) {
@@ -580,7 +598,104 @@ private fun SxFolderSettingRow(title: String, path: String, custom: Boolean, rea
 }
 
 @Composable
-private fun SxHeader(state: MainUiState, height: Dp, onSettings: () -> Unit, onPickSoundFont: () -> Unit) {
+private fun SxFxSlider(label: String, value: Int, range: IntRange, unit: String, onChange: (Int) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Text(label, color = SxDim, fontSize = 8.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(62.dp))
+        Slider(
+            value = value.toFloat(),
+            onValueChange = { onChange(it.roundToInt().coerceIn(range.first, range.last)) },
+            valueRange = range.first.toFloat()..range.last.toFloat(),
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            (if (range.first < 0 && value > 0) "+" else "") + value + unit,
+            color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold,
+            modifier = Modifier.width(48.dp)
+        )
+    }
+}
+
+@Composable
+private fun SxDspDialog(fx: FxSettings, onChange: (FxSettings) -> Unit, onDismiss: () -> Unit) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(color = SxPanel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth(.94f).fillMaxHeight(.9f)) {
+            Column(Modifier.fillMaxSize().padding(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("DSP  •  MASTER EFFECTS", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    Text(if (fx.enabled) "ON" else "BYPASS", color = if (fx.enabled) SxGreen else SxDim, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    Switch(checked = fx.enabled, onCheckedChange = { onChange(fx.copy(enabled = it)) }, modifier = Modifier.padding(horizontal = 6.dp))
+                    TextButton(onClick = onDismiss) { Text("CLOSE") }
+                }
+                Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Surface(color = SxPanel2, shape = RoundedCornerShape(4.dp), modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(9.dp)) {
+                            Text("REVERB", color = SxOrangeBright, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                FxSettings.REVERB_TYPES.forEach { (name, time, damp) ->
+                                    val active = fx.reverbTime == time && fx.reverbDamp == damp
+                                    OutlinedButton(
+                                        onClick = { onChange(fx.copy(reverbTime = time, reverbDamp = damp, reverbLevel = if (fx.reverbLevel == 0) 40 else fx.reverbLevel)) },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                        modifier = Modifier.height(28.dp)
+                                    ) { Text(name, fontSize = 8.sp, color = if (active) SxGreen else Color.White) }
+                                }
+                            }
+                            SxFxSlider("LEVEL", fx.reverbLevel, 0..127, "") { onChange(fx.copy(reverbLevel = it)) }
+                            SxFxSlider("TIME", fx.reverbTime, 0..127, "") { onChange(fx.copy(reverbTime = it)) }
+                            SxFxSlider("DAMP", fx.reverbDamp, 0..127, "") { onChange(fx.copy(reverbDamp = it)) }
+                        }
+                    }
+                    Surface(color = SxPanel2, shape = RoundedCornerShape(4.dp), modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(9.dp)) {
+                            Text("CHORUS", color = SxOrangeBright, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            SxFxSlider("LEVEL", fx.chorusLevel, 0..127, "") { onChange(fx.copy(chorusLevel = it)) }
+                            SxFxSlider("RATE", fx.chorusRate, 0..127, "") { onChange(fx.copy(chorusRate = it)) }
+                            SxFxSlider("DEPTH", fx.chorusDepth, 0..127, "") { onChange(fx.copy(chorusDepth = it)) }
+                        }
+                    }
+                    Surface(color = SxPanel2, shape = RoundedCornerShape(4.dp), modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(9.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("EQUALIZER", color = SxOrangeBright, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                                TextButton(onClick = { onChange(fx.copy(eqLow = 0, eqMid = 0, eqHigh = 0)) }, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) { Text("FLAT", fontSize = 8.sp) }
+                            }
+                            SxFxSlider("LOW 100Hz", fx.eqLow, -12..12, "dB") { onChange(fx.copy(eqLow = it)) }
+                            SxFxSlider("MID 1kHz", fx.eqMid, -12..12, "dB") { onChange(fx.copy(eqMid = it)) }
+                            SxFxSlider("HIGH 8kHz", fx.eqHigh, -12..12, "dB") { onChange(fx.copy(eqHigh = it)) }
+                        }
+                    }
+                    Text("Effects apply to the final mix (style + keyboard). Settings are saved automatically.", color = SxDim, fontSize = 8.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SxBpmDialog(current: Int, onDismiss: () -> Unit, onSet: (Int) -> Unit) {
+    var text by remember { mutableStateOf(current.toString()) }
+    val parsed = text.toIntOrNull()
+    val valid = parsed != null && parsed in 20..280
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("SET TEMPO (BPM)") },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { v -> text = v.filter { it.isDigit() }.take(3) },
+                singleLine = true,
+                isError = !valid,
+                supportingText = { Text("20 – 280") },
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number)
+            )
+        },
+        confirmButton = { TextButton(enabled = valid, onClick = { onSet(parsed ?: current) }) { Text("SET") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("CANCEL") } }
+    )
+}
+
+@Composable
+private fun SxHeader(state: MainUiState, height: Dp, onSettings: () -> Unit, onDsp: () -> Unit, onPickSoundFont: () -> Unit) {
     Surface(color = Color(0xFF080A0C), shape = RoundedCornerShape(5.dp), modifier = Modifier.fillMaxWidth().height(height).border(1.dp, Color(0xFF333A42), RoundedCornerShape(5.dp))) {
         Row(Modifier.fillMaxSize().padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("YAMAHA", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
@@ -589,6 +704,10 @@ private fun SxHeader(state: MainUiState, height: Dp, onSettings: () -> Unit, onP
             Spacer(Modifier.weight(1f))
             Text("● MIDI", color = if (state.midiStatus.startsWith("No")) SxDim else SxGreen, fontSize = 8.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.width(8.dp))
+            Surface(color = Color(0xFF252B31), shape = RoundedCornerShape(3.dp), modifier = Modifier.clickable(onClick = onDsp).border(1.dp, Color(0xFF39434B), RoundedCornerShape(3.dp))) {
+                Text("DSP", color = Color.White, fontSize = 7.sp, maxLines = 1, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
+            }
+            Spacer(Modifier.width(6.dp))
             Surface(color = Color(0xFF252B31), shape = RoundedCornerShape(3.dp), modifier = Modifier.clickable(onClick = onSettings).border(1.dp, Color(0xFF39434B), RoundedCornerShape(3.dp))) {
                 Text("FOLDER", color = Color.White, fontSize = 7.sp, maxLines = 1, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
             }
@@ -715,6 +834,9 @@ private fun SxSideMenu(
     selectedParameter: String,
     parameterValue: String,
     onStep: (Int) -> Unit,
+    onSelectParameter: (String) -> Unit,
+    onTapTempo: () -> Unit,
+    onEnterTempo: () -> Unit,
     onPickStyle: () -> Unit
 ) {
     Surface(color = SxPanel, shape = RoundedCornerShape(5.dp), modifier = modifier.border(1.dp, Color(0xFF303942), RoundedCornerShape(5.dp))) {
@@ -752,13 +874,23 @@ private fun SxSideMenu(
             }
             Spacer(Modifier.height(if (compact) 5.dp else 7.dp))
             Text("SELECTED", color = SxDim, fontSize = 5.sp, fontWeight = FontWeight.Bold)
-            Row(Modifier.fillMaxWidth().height(if (compact) 35.dp else 42.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                listOf("TEMPO", "TRANSPOSE", "RELEASE").forEach { item ->
-                    val active = selectedParameter == item
-                    Surface(color = if (active) SxBlue else Color(0xFF1D2329), shape = RoundedCornerShape(3.dp), modifier = Modifier.fillMaxHeight().weight(1f).border(1.dp, if (active) SxGreen else Color(0xFF35404A), RoundedCornerShape(3.dp))) {
-                        Box(contentAlignment = Alignment.Center) { Text(item, color = Color.White, fontSize = if (compact) 5.sp else 6.sp, fontWeight = FontWeight.Bold) }
+            if (selectedParameter == "TEMPO") {
+                Row(Modifier.fillMaxWidth().height(if (compact) 26.dp else 30.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Button(onClick = onTapTempo, modifier = Modifier.weight(1f).fillMaxHeight(), contentPadding = PaddingValues(0.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF34506B))) { Text("TAP", fontSize = 8.sp) }
+                    Button(onClick = onEnterTempo, modifier = Modifier.weight(1f).fillMaxHeight(), contentPadding = PaddingValues(0.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF34506B))) { Text("BPM…", fontSize = 8.sp) }
+                }
+                Spacer(Modifier.height(4.dp))
+            }
+            listOf(listOf("TEMPO", "TRANSPOSE", "RELEASE"), listOf("SPLIT", "OCT R1", "OCT R2", "OCT R3")).forEach { rowItems ->
+                Row(Modifier.fillMaxWidth().height(if (compact) 28.dp else 34.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                    rowItems.forEach { item ->
+                        val active = selectedParameter == item
+                        Surface(color = if (active) SxBlue else Color(0xFF1D2329), shape = RoundedCornerShape(3.dp), modifier = Modifier.fillMaxHeight().weight(1f).clickable { onSelectParameter(item) }.border(1.dp, if (active) SxGreen else Color(0xFF35404A), RoundedCornerShape(3.dp))) {
+                            Box(contentAlignment = Alignment.Center) { Text(item, color = Color.White, fontSize = if (compact) 5.sp else 6.sp, fontWeight = FontWeight.Bold, maxLines = 1) }
+                        }
                     }
                 }
+                Spacer(Modifier.height(3.dp))
             }
             Spacer(Modifier.weight(1f))
             Surface(color = Color(0xFF1D2329), shape = RoundedCornerShape(3.dp), modifier = Modifier.fillMaxWidth().height(if (compact) 34.dp else 40.dp).clickable(onClick = onPickStyle).border(1.dp, Color(0xFF343C45), RoundedCornerShape(3.dp))) {
@@ -829,7 +961,12 @@ private fun SxCenterDisplay(
 ) {
     Surface(color = Color(0xFF101419), shape = RoundedCornerShape(6.dp), modifier = modifier.border(2.dp, Color(0xFF39424C), RoundedCornerShape(6.dp))) {
         if (lcdPage == "STYLE") {
+            val favorites by vm.styleFavorites.collectAsState()
+            val recent by vm.styleRecent.collectAsState()
             SxStyleLcdPage(
+                favorites = favorites,
+                recent = recent,
+                onToggleFavorite = vm::toggleStyleFavorite,
                 state = state,
                 styleFolders = styleFolders,
                 styleFiles = styleFiles,
@@ -879,7 +1016,7 @@ private fun SxCenterDisplay(
                     SxValue("TEMPO", state.tempoBpm.toString(), Modifier.weight(.8f), vm::onTempoDown, vm::onTempoUp, compact, selectedDataParameter == "TEMPO") { onDataParameterSelect("TEMPO") }
                     SxValue("TRANSPOSE", if (state.transpose >= 0) "+" + state.transpose else state.transpose.toString(), Modifier.weight(.9f), vm::onTransposeDown, vm::onTransposeUp, compact, selectedDataParameter == "TRANSPOSE") { onDataParameterSelect("TRANSPOSE") }
                     SxValue("RELEASE", state.releaseTime.toString(), Modifier.weight(.8f), vm::onReleaseDown, vm::onReleaseUp, compact, selectedDataParameter == "RELEASE") { onDataParameterSelect("RELEASE") }
-                    SxValue("SPLIT", state.splitPoint, Modifier.weight(.8f), null, null, compact)
+                    SxValue("SPLIT", state.splitPoint, Modifier.weight(.8f), vm::onSplitDown, vm::onSplitUp, compact, selectedDataParameter == "SPLIT") { onDataParameterSelect("SPLIT") }
                     Surface(color = Color(0xFF172029), shape = RoundedCornerShape(3.dp), modifier = Modifier.weight(1.25f).fillMaxHeight().border(1.dp, Color(0xFF34404C), RoundedCornerShape(3.dp))) {
                         Row(Modifier.fillMaxSize().padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
                             Text("PART", color = SxDim, fontSize = 6.sp, fontWeight = FontWeight.Bold)
@@ -895,6 +1032,9 @@ private fun SxCenterDisplay(
 
 @Composable
 private fun SxStyleLcdPage(
+    favorites: Set<String>,
+    recent: List<String>,
+    onToggleFavorite: (Uri) -> Unit,
     state: MainUiState,
     styleFolders: List<StyleFolder>,
     styleFiles: List<Pair<Uri, String>>,
@@ -907,17 +1047,44 @@ private fun SxStyleLcdPage(
     onBrowse: () -> Unit,
     onBack: () -> Unit
 ) {
-    val visibleStyleFiles = remember(selectedStyleFolderUri, styleFiles, styleFolders) {
+    var query by remember { mutableStateOf("") }
+    var sortMode by remember { mutableStateOf("A-Z") }        // A-Z, Z-A, RECENT, FAV
+    var favOnly by remember { mutableStateOf(false) }
+    val searching = query.isNotBlank()
+
+    val visibleStyleFiles = remember(selectedStyleFolderUri, styleFiles, styleFolders, query, sortMode, favOnly, favorites, recent) {
         val folderPath = selectedStyleFolderUri?.path?.let(Uri::decode)?.trimEnd('/')
         val isRoot = styleFolders.firstOrNull { it.uri == selectedStyleFolderUri }?.isRoot == true
-        if (folderPath == null) emptyList()
-        else styleFiles.filter { (uri, _) ->
-            val p = uri.path?.let(Uri::decode)?.trimEnd('/') ?: return@filter false
-            // Root folder = only files directly inside it; others include sub-folders.
-            if (isRoot) p.substringBeforeLast('/') == folderPath else p.startsWith(folderPath + "/")
+        // A search looks through the WHOLE style library, not just the open folder.
+        val base = when {
+            searching -> styleFiles
+            folderPath == null -> emptyList()
+            else -> styleFiles.filter { (uri, _) ->
+                val p = uri.path?.let(Uri::decode)?.trimEnd('/') ?: return@filter false
+                // Root folder = only files directly inside it; others include sub-folders.
+                if (isRoot) p.substringBeforeLast('/') == folderPath else p.startsWith(folderPath + "/")
+            }
+        }
+        val words = query.trim().lowercase().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val filtered = base.filter { (uri, name) ->
+            val lower = name.lowercase()
+            (words.isEmpty() || words.all { lower.contains(it) }) &&
+                (!favOnly || uri.path?.let { it in favorites } == true)
+        }
+        val recentIndex = recent.withIndex().associate { (i, p) -> p to i }
+        val byName = compareBy<Pair<Uri, String>> { it.second.lowercase() }
+        when (sortMode) {
+            "Z-A" -> filtered.sortedWith(byName).reversed()
+            "RECENT" -> filtered.sortedWith(
+                compareBy<Pair<Uri, String>> { it.first.path?.let { p -> recentIndex[p] } ?: Int.MAX_VALUE }.then(byName)
+            )
+            "FAV" -> filtered.sortedWith(
+                compareBy<Pair<Uri, String>> { if (it.first.path?.let { p -> p in favorites } == true) 0 else 1 }.then(byName)
+            )
+            else -> filtered.sortedWith(byName)
         }
     }
-    var page by remember(selectedStyleFolderUri) { mutableStateOf(0) }
+    var page by remember(selectedStyleFolderUri, query, sortMode, favOnly) { mutableStateOf(0) }
     val pageSize = 16
     val pageCount = maxOf(1, (visibleStyleFiles.size + pageSize - 1) / pageSize)
     val safePage = page.coerceIn(0, pageCount - 1)
@@ -932,15 +1099,42 @@ private fun SxStyleLcdPage(
                 color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                 maxLines = 1, overflow = TextOverflow.Ellipsis
             )
-            Spacer(Modifier.weight(1f))
-            Text("${visibleStyleFiles.size} STYLES", color = SxDim, fontSize = 7.sp)
+            Spacer(Modifier.width(6.dp))
+            Box(
+                Modifier.weight(1f).fillMaxHeight().padding(vertical = 3.dp)
+                    .background(Color(0xFF080B0E), RoundedCornerShape(3.dp))
+                    .border(1.dp, if (searching) SxBlue else Color(0xFF38424C), RoundedCornerShape(3.dp)),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                androidx.compose.foundation.text.BasicTextField(
+                    value = query,
+                    onValueChange = { query = it.take(40) },
+                    singleLine = true,
+                    textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 10.sp),
+                    cursorBrush = androidx.compose.ui.graphics.SolidColor(Color.White),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp),
+                    decorationBox = { inner ->
+                        if (query.isEmpty()) Text("SEARCH ALL STYLES…", color = SxDim, fontSize = 9.sp)
+                        inner()
+                    }
+                )
+            }
+            if (searching) TextButton(onClick = { query = "" }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("✕", color = SxDim, fontSize = 10.sp) }
+            TextButton(
+                onClick = { sortMode = when (sortMode) { "A-Z" -> "Z-A"; "Z-A" -> "RECENT"; "RECENT" -> "FAV"; else -> "A-Z" } },
+                contentPadding = PaddingValues(horizontal = 4.dp)
+            ) { Text("SORT: $sortMode", color = SxBlue, fontSize = 8.sp) }
+            TextButton(onClick = { favOnly = !favOnly }, contentPadding = PaddingValues(horizontal = 4.dp)) {
+                Text(if (favOnly) "★ FAV ONLY" else "☆ FAV", color = if (favOnly) SxOrangeBright else SxDim, fontSize = 8.sp)
+            }
+            Text("${visibleStyleFiles.size}", color = SxDim, fontSize = 7.sp)
             TextButton(onClick = onBack, contentPadding = PaddingValues(horizontal = 4.dp)) {
                 Text("HOME", color = SxGreen, fontSize = 8.sp)
             }
         }
 
         when {
-            selectedStyleFolderUri == null -> Surface(
+            selectedStyleFolderUri == null && !searching -> Surface(
                 color = Color(0xFF151A20), shape = RoundedCornerShape(4.dp),
                 modifier = Modifier.fillMaxWidth().weight(1f)
             ) {
@@ -953,7 +1147,7 @@ private fun SxStyleLcdPage(
                 modifier = Modifier.fillMaxWidth().weight(1f)
             ) {
                 Box(contentAlignment = Alignment.Center) {
-                    Text("NO STYLE FILES IN THIS FOLDER", color = SxDim, fontSize = 9.sp)
+                    Text(if (searching || favOnly) "NO MATCHING STYLES" else "NO STYLE FILES IN THIS FOLDER", color = SxDim, fontSize = 9.sp)
                 }
             }
             else -> Surface(
@@ -983,8 +1177,16 @@ private fun SxStyleLcdPage(
                                             RoundedCornerShape(3.dp)
                                         )
                                 ) {
+                                    Box(Modifier.fillMaxSize()) {
+                                    val isFav = item.first.path?.let { it in favorites } == true
+                                    Text(
+                                        if (isFav) "★" else "☆",
+                                        color = if (isFav) SxOrangeBright else SxDim,
+                                        fontSize = 12.sp,
+                                        modifier = Modifier.align(Alignment.TopEnd).clickable { onToggleFavorite(item.first) }.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
                                     Column(
-                                        Modifier.fillMaxSize().padding(horizontal = 6.dp, vertical = 3.dp),
+                                        Modifier.fillMaxSize().padding(start = 6.dp, end = 22.dp, top = 3.dp, bottom = 3.dp),
                                         verticalArrangement = Arrangement.Center
                                     ) {
                                         Text(
@@ -1001,6 +1203,7 @@ private fun SxStyleLcdPage(
                                             fontSize = 5.sp, maxLines = 1
                                         )
                                     }
+                                    }
                                 }
                             }
                             repeat(4 - rowItems.size) { Spacer(Modifier.weight(1f)) }
@@ -1015,7 +1218,10 @@ private fun SxStyleLcdPage(
             Modifier.fillMaxWidth().height(if (compact) 34.dp else 39.dp),
             horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            (0..5).forEach { index ->
+            // Windowed pager: 6 buttons that follow the current page, so libraries
+            // with more than 96 styles (or search results) are fully reachable.
+            val windowStart = (safePage / 6) * 6
+            (windowStart..windowStart + 5).forEach { index ->
                 val enabled = index < pageCount
                 Surface(
                     color = if (safePage == index) SxOrange else if (enabled) Color(0xFF303840) else Color(0xFF171B20),

@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.yourapp.yamahaarranger.arranger.ArrangerBrain
 import com.yourapp.yamahaarranger.arranger.ArrangerSection
 import com.yourapp.yamahaarranger.audio.AudioEngineManager
+import com.yourapp.yamahaarranger.audio.Fx
 import com.yourapp.audio.SoundFontInspector
 import com.yourapp.midi.MidiInputManager
 import com.yourapp.yamahaarranger.style.StyleRepository
@@ -102,6 +103,12 @@ object DebugLog {
     fun getLongText(): String = longText
     fun getFullText(): String = getFullAll().joinToString("\n")
     fun clear() { synchronized(lock) { head = 0; count = 0; java.util.Arrays.fill(messages, null) }; longText = "" }
+}
+
+/** Yamaha note naming: middle C (MIDI 60) = C3. */
+fun noteLabel(note: Int): String {
+    val names = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+    return names[((note % 12) + 12) % 12] + (Math.floorDiv(note, 12) - 2)
 }
 
 data class VoiceSlot(
@@ -209,7 +216,7 @@ data class MainUiState(
     val midiStatus: String = "No MIDI device", val midiOutEnabled: Boolean = false, val soundFontName: String = "None",
     val styleVolume: Int = 100, val leftVolume: Int = 100, val right1Volume: Int = 100, val right2Volume: Int = 100, val right3Volume: Int = 100, val masterVolume: Int = 100,
     val activeBank: Int = 1, val activeRegSlot: Int = 0, val voiceName: String = "GrandPiano",
-    val right2Name: String = "OFF", val splitPoint: String = "C4",
+    val right2Name: String = "OFF", val splitPoint: String = "F#2", val splitNote: Int = 54, val layerOctaves: List<Int> = listOf(0, 0, 0),
     val acmpEnabled: Boolean = true, val leftVoiceEnabled: Boolean = true, val sustainEnabled: Boolean = false, val releaseTime: Int = 64,
     val rightVoices: List<KeyboardVoiceSlot> = defaultKeyboardVoices(),
     val voiceAssignments: List<VoiceSlot> = defaultVoices(),
@@ -227,7 +234,9 @@ class MainViewModel @Inject constructor(
     private val styleRepository: StyleRepository,
     private val contentResolver: ContentResolverProvider,
     private val midiInputManager: MidiInputManager,
-    private val audioEngine: AudioEngineManager
+    private val audioEngine: AudioEngineManager,
+    private val fxPrefs: FxPrefs,
+    private val stylePrefs: StylePrefs
 ) : ViewModel() {
     private val _styleName = MutableStateFlow("No Style Loaded")
     private val _midiStatus = MutableStateFlow("No MIDI device")
@@ -257,6 +266,49 @@ class MainViewModel @Inject constructor(
     /** Where Style / SoundFont files are read from (Settings > Storage). */
     val storageSettings: StateFlow<StorageSettings> = _storageSettings
     @Volatile private var sf2AutoLoadRunning = false
+
+    // ---- Master DSP ------------------------------------------------------
+    private val _fx = MutableStateFlow(fxPrefs.load())
+    val fxSettings: StateFlow<FxSettings> = _fx
+
+    fun setFx(newSettings: FxSettings) {
+        val s2 = newSettings.copy(
+            reverbLevel = newSettings.reverbLevel.coerceIn(0, 127), reverbTime = newSettings.reverbTime.coerceIn(0, 127),
+            reverbDamp = newSettings.reverbDamp.coerceIn(0, 127), chorusLevel = newSettings.chorusLevel.coerceIn(0, 127),
+            chorusRate = newSettings.chorusRate.coerceIn(0, 127), chorusDepth = newSettings.chorusDepth.coerceIn(0, 127),
+            eqLow = newSettings.eqLow.coerceIn(-12, 12), eqMid = newSettings.eqMid.coerceIn(-12, 12), eqHigh = newSettings.eqHigh.coerceIn(-12, 12)
+        )
+        val old = _fx.value
+        _fx.value = s2
+        applyFx(s2, old)
+        fxPrefs.save(s2)
+    }
+
+    /** Pushes only the values that changed (everything when [old] is null). */
+    private fun applyFx(n: FxSettings, old: FxSettings?) {
+        fun push(id: Int, v: Float, changed: Boolean) { if (old == null || changed) audioEngine.setFxParam(id, v) }
+        push(Fx.ENABLED, if (n.enabled) 1f else 0f, old?.enabled != n.enabled)
+        push(Fx.REVERB_LEVEL, n.reverbLevel.toFloat(), old?.reverbLevel != n.reverbLevel)
+        push(Fx.REVERB_TIME, n.reverbTime.toFloat(), old?.reverbTime != n.reverbTime)
+        push(Fx.REVERB_DAMP, n.reverbDamp.toFloat(), old?.reverbDamp != n.reverbDamp)
+        push(Fx.CHORUS_LEVEL, n.chorusLevel.toFloat(), old?.chorusLevel != n.chorusLevel)
+        push(Fx.CHORUS_RATE, n.chorusRate.toFloat(), old?.chorusRate != n.chorusRate)
+        push(Fx.CHORUS_DEPTH, n.chorusDepth.toFloat(), old?.chorusDepth != n.chorusDepth)
+        push(Fx.EQ_LOW, n.eqLow.toFloat(), old?.eqLow != n.eqLow)
+        push(Fx.EQ_MID, n.eqMid.toFloat(), old?.eqMid != n.eqMid)
+        push(Fx.EQ_HIGH, n.eqHigh.toFloat(), old?.eqHigh != n.eqHigh)
+    }
+
+    // ---- Style favorites / recent ----------------------------------------
+    private val _styleFavorites = MutableStateFlow(stylePrefs.favorites())
+    val styleFavorites: StateFlow<Set<String>> = _styleFavorites
+    private val _styleRecent = MutableStateFlow(stylePrefs.recent())
+    val styleRecent: StateFlow<List<String>> = _styleRecent
+
+    fun toggleStyleFavorite(uri: Uri) {
+        val path = uri.path ?: return
+        _styleFavorites.value = stylePrefs.toggleFavorite(path)
+    }
 
     private val volumeState = combine(
         combine(_styleVolume, _leftVolume, _right1Volume, _right2Volume, _right3Volume) { s, l, r1, r2, r3 ->
@@ -334,6 +386,9 @@ class MainViewModel @Inject constructor(
             voiceName = rightVoices.getOrNull(0)?.displayName() ?: "OFF",
             right2Name = if (rightVoices.getOrNull(1)?.enabled == true) rightVoices.getOrNull(1)?.displayName() ?: "OFF" else "OFF",
             rightVoices = rightVoices,
+            splitPoint = noteLabel(arranger.splitNote),
+            splitNote = arranger.splitNote,
+            layerOctaves = arranger.layerOctaves,
             voiceAssignments = voices,
             availableSoundFonts = sfFiles
         )
@@ -342,6 +397,7 @@ class MainViewModel @Inject constructor(
     init {
         arrangerBrain.attachScope(viewModelScope)
         DebugLog.add("🎵 ViewModel init")
+        applyFx(_fx.value, null)
         DebugLog.add("📂 SF2 folder: ${contentResolver.getSoundFontLocation()}")
         DebugLog.add("📂 Style folder: ${contentResolver.getStyleLocation()}")
         if (!contentResolver.hasPublicStorageAccess()) {
@@ -420,7 +476,26 @@ class MainViewModel @Inject constructor(
     }
     fun onSyncStart() { }
     fun onStartStop() = arrangerBrain.startStop()
-    fun onTapTempo() { }
+    private val tapTimes = ArrayDeque<Long>()
+
+    /** Tap tempo: average of the last taps; a pause > 2 s starts a new measurement. */
+    fun onTapTempo() {
+        val now = System.nanoTime()
+        if (tapTimes.isNotEmpty() && now - tapTimes.last() > 2_000_000_000L) tapTimes.clear()
+        tapTimes.addLast(now)
+        while (tapTimes.size > 6) tapTimes.removeFirst()
+        if (tapTimes.size < 2) { DebugLog.add("🥁 TAP 1/2…"); return }
+        val avgNs = (tapTimes.last() - tapTimes.first()).toDouble() / (tapTimes.size - 1)
+        val bpm = Math.round(60_000_000_000.0 / avgNs).toInt().coerceIn(20, 280)
+        arrangerBrain.setTempo(bpm)
+        DebugLog.add("🥁 TAP TEMPO = $bpm")
+    }
+
+    fun setTempoDirect(bpm: Int) {
+        val v = bpm.coerceIn(20, 280)
+        arrangerBrain.setTempo(v)
+        DebugLog.add("🥁 TEMPO = $v")
+    }
     fun onTempoDown() { arrangerBrain.setTempo((arrangerBrain.state.value.tempoBpm - 5).coerceIn(20, 280)) }
     fun onTempoUp() { arrangerBrain.setTempo((arrangerBrain.state.value.tempoBpm + 5).coerceIn(20, 280)) }
     fun onTransposeDown() {
@@ -433,6 +508,13 @@ class MainViewModel @Inject constructor(
         _transpose.value = value
         arrangerBrain.setKeyboardTranspose(value)
     }
+    fun onSplitDown() = arrangerBrain.setSplitPoint(arrangerBrain.state.value.splitNote - 1)
+    fun onSplitUp() = arrangerBrain.setSplitPoint(arrangerBrain.state.value.splitNote + 1)
+    fun onLayerOctave(layer: Int, delta: Int) {
+        val cur = arrangerBrain.state.value.layerOctaves.getOrElse(layer) { 0 }
+        arrangerBrain.setLayerOctave(layer, cur + delta)
+    }
+
     fun onReleaseDown() {
         val value = (_releaseTime.value - 1).coerceIn(0, 127)
         _releaseTime.value = value
@@ -648,6 +730,7 @@ class MainViewModel @Inject constructor(
             _styleName.value = fileName
             DebugLog.add("🎼 Mixer channels from style: ${_voiceAssignments.value.map { "${it.channel}:${it.sf2Name}@${it.bank}/${it.program}" }.joinToString()}")
             DebugLog.add("✅ Loaded: $fileName")
+            uri.path?.let { _styleRecent.value = stylePrefs.markUsed(it) }
         }
     }
 

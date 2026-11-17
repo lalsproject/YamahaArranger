@@ -56,6 +56,7 @@ bool AudioEngine::start() {
     }
 
     outputSampleRate_ = stream_->getSampleRate();
+    masterFx_.init(outputSampleRate_);
     LOGI("Stream opened: sr=%d ch=%d sharing=%d perf=%d api=%d",
          outputSampleRate_,
          stream_->getChannelCount(),
@@ -147,6 +148,7 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(
         // itself is normally operated around 90% volume to avoid overload.
         const auto t0 = std::chrono::steady_clock::now();
         soundFont_.render(out, numFrames);
+        masterFx_.process(out, numFrames);   // no-op while disabled
         const auto usedUs = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0).count();
         const double budgetUs = 1.0e6 * numFrames / std::max(1, outputSampleRate_);

@@ -6,6 +6,7 @@
 #include <string>
 #include "voice.h"
 #include "bassmidi_player.h"
+#include "master_fx.h"
 
 class AudioEngine : public oboe::AudioStreamDataCallback {
 public:
@@ -19,6 +20,7 @@ public:
     bool isDrumSoundFontLoaded() const{return soundFont_.isDrumLoaded();}
     void unloadSoundFont();
     void setSoundFontWorkDir(const std::string& dir){soundFont_.setWorkDir(dir);}
+    void setFxParam(int id,float value){masterFx_.setParam(id,value);}
     void noteOn(int midiNote,int rootNote,float velocity01,const float* sampleData,size_t sampleFrames,int sampleRateHz);
     void noteOff(int midiNote); void allNotesOff();
     void sfNoteOnChannel(int channel,int midiNote,float velocity01);
@@ -38,6 +40,7 @@ private:
     // moment becomes a (tiny) latency increase instead of audible crackle.
     std::unique_ptr<oboe::LatencyTuner> latencyTuner_;
     int overBudget_ = 0;   // audio-callback only
+    fx::MasterFx masterFx_; // EQ -> chorus -> reverb on the final mix
     std::array<Voice,kMaxPolyphony> voices_;
     std::mutex voiceMutex_;
     int outputSampleRate_=48000;

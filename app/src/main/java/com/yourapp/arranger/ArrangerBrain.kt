@@ -39,7 +39,9 @@ data class ArrangerState(
     val currentChordLabel: String = "",
     val autoFill: Boolean = true,
     val acmpEnabled: Boolean = true,
-    val leftVoiceEnabled: Boolean = true
+    val leftVoiceEnabled: Boolean = true,
+    val splitNote: Int = 54,
+    val layerOctaves: List<Int> = listOf(0, 0, 0),
 )
 
 @Singleton
@@ -211,18 +213,57 @@ class ArrangerBrain @Inject constructor(
         DebugLog.add("🎹 TRANSPOSE = " + if (keyboardTranspose >= 0) "+$keyboardTranspose" else keyboardTranspose.toString())
     }
 
+    // Per-layer octave shift (RIGHT 1/2/3), in octaves (-2..+2).
+    private val layerOctave = intArrayOf(0, 0, 0)
+
+    // Input key -> note actually sounding on each layer (-1 = layer silent).
+    // Note-off must release exactly what note-on started, even if the layer was
+    // switched off or its octave changed while the key was held (otherwise the
+    // note would hang).
+    private val layerSounding = HashMap<Int, IntArray>()
+
+    private fun playRightLayers(midiNote: Int, outputNote: Int, velocity: Float, velocity127: Int) {
+        val sounding = IntArray(3) { -1 }
+        for (channel in 0..2) {
+            if (!rightVoiceEnabled[channel]) continue
+            val layerNote = (outputNote + layerOctave[channel] * 12).coerceIn(0, 127)
+            sounding[channel] = layerNote
+            stopSustainedNote(channel, layerNote)
+            engineNoteOn(channel, layerNote, velocity)
+            midiInputManager.sendNoteOn(channel, layerNote, velocity127)
+        }
+        layerSounding.put(midiNote, sounding)?.let { previous ->
+            // Same key pressed again without a release: free the older instance.
+            for (channel in 0..2) if (previous[channel] >= 0 && previous[channel] != sounding[channel]) {
+                releaseKeyboardNote(channel, previous[channel])
+            }
+        }
+    }
+
+    private fun releaseRightLayers(midiNote: Int, outputNote: Int) {
+        val sounding = layerSounding.remove(midiNote)
+        for (channel in 0..2) {
+            val note = if (sounding != null) sounding[channel]
+            else if (rightVoiceEnabled[channel]) (outputNote + layerOctave[channel] * 12).coerceIn(0, 127)
+            else -1
+            if (note >= 0) releaseKeyboardNote(channel, note)
+        }
+    }
+
+    fun setLayerOctave(layer: Int, octave: Int) {
+        if (layer !in 0..2) return
+        layerOctave[layer] = octave.coerceIn(-2, 2)
+        _state.update { it.copy(layerOctaves = layerOctave.toList()) }
+        DebugLog.add("🎹 RIGHT ${layer + 1} octave = ${layerOctave[layer]}")
+    }
+
     fun onKeyboardNoteOn(midiNote: Int, velocity: Float) {
         val velocity127 = (velocity * 127f).toInt().coerceIn(0, 127)
         val outputNote = (midiNote + keyboardTranspose).coerceIn(0, 127)
         if (midiNote > splitNote) {
             transposedNotes[midiNote] = outputNote
             DebugLog.add("🎹 RIGHT IN note=$midiNote → pitch=$outputNote vel=$velocity127")
-            for (channel in 0..2) {
-                if (!rightVoiceEnabled[channel]) continue
-                stopSustainedNote(channel, outputNote)
-                engineNoteOn(channel, outputNote, velocity)
-                midiInputManager.sendNoteOn(channel, outputNote, velocity127)
-            }
+            playRightLayers(midiNote, outputNote, velocity, velocity127)
             return
         }
         if (acmpEnabled && leftVoiceEnabled) {
@@ -239,12 +280,7 @@ class ArrangerBrain @Inject constructor(
         } else {
             transposedNotes[midiNote] = outputNote
             DebugLog.add("🎹 LEFT IN note=$midiNote → pitch=$outputNote vel=$velocity127 → R1/R2/R3 (ACMP/L OFF)")
-            for (channel in 0..2) {
-                if (!rightVoiceEnabled[channel]) continue
-                stopSustainedNote(channel, outputNote)
-                engineNoteOn(channel, outputNote, velocity)
-                midiInputManager.sendNoteOn(channel, outputNote, velocity127)
-            }
+            playRightLayers(midiNote, outputNote, velocity, velocity127)
         }
     }
 
@@ -253,10 +289,7 @@ class ArrangerBrain @Inject constructor(
         if (midiNote > splitNote) {
             DebugLog.add("🎹 RIGHT OFF note=$midiNote → pitch=$outputNote → R1/R2/R3 OFF" +
                 if (keyboardSustain) " (held by sustain)" else "")
-            for (channel in 0..2) {
-                if (!rightVoiceEnabled[channel]) continue
-                releaseKeyboardNote(channel, outputNote)
-            }
+            releaseRightLayers(midiNote, outputNote)
             return
         }
         if (acmpEnabled && leftVoiceEnabled) {
@@ -278,10 +311,7 @@ class ArrangerBrain @Inject constructor(
         } else {
             DebugLog.add("🎹 LEFT OFF note=$midiNote → pitch=$outputNote → R1/R2/R3 OFF (LEFT OFF)" +
                 if (keyboardSustain) " (held by sustain)" else "")
-            for (channel in 0..2) {
-                if (!rightVoiceEnabled[channel]) continue
-                releaseKeyboardNote(channel, outputNote)
-            }
+            releaseRightLayers(midiNote, outputNote)
         }
     }
 
@@ -331,7 +361,7 @@ class ArrangerBrain @Inject constructor(
         splitNote = midiNote.coerceIn(24, 96)
         chordDetector.reset()
         appliedChord = null
-        _state.update { it.copy(currentChordLabel = "") }
+        _state.update { it.copy(currentChordLabel = "", splitNote = splitNote) }
         DebugLog.add("🎹 Split Point: $splitNote")
     }
 

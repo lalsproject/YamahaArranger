@@ -37,6 +37,9 @@ class AudioEngineManager @Inject constructor(
         loggerReady = true
     }
 
+    /** Master DSP parameter (ids = fx::Param in master_fx.h, see [Fx]). */
+    fun setFxParam(id: Int, value: Float) = bridge.nativeSetFxParam(id, value)
+
     /** Directory for generated working copies of SoundFonts (app cache). */
     fun setSoundFontWorkDir(path: String) {
         ensureLogger()
@@ -305,4 +308,18 @@ class AudioEngineManager @Inject constructor(
         val sample = sampleProvider.sampleForNote(note) ?: return
         bridge.nativeNoteOn(note, sample.rootNote, velocity, sample.buffer, sample.frameCount, sample.sampleRateHz)
     }
+}
+
+/** Parameter ids of the native master DSP (must match enum fx::Param). */
+object Fx {
+    const val ENABLED = 0
+    const val REVERB_LEVEL = 1
+    const val REVERB_TIME = 2
+    const val REVERB_DAMP = 3
+    const val CHORUS_LEVEL = 4
+    const val CHORUS_RATE = 5
+    const val CHORUS_DEPTH = 6
+    const val EQ_LOW = 7
+    const val EQ_MID = 8
+    const val EQ_HIGH = 9
 }
